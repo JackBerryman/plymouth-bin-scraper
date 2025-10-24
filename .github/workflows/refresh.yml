@@ -1,0 +1,65 @@
+name: Refresh bin schedule
+
+on:
+  workflow_dispatch:
+    inputs:
+      postcode:
+        description: "Postcode (e.g., PL6 5HX)"
+        required: true
+        default: "PL6 5HX"
+      address_hint:
+        description: "Address hint (e.g., 72 Windermere)"
+        required: true
+        default: "72 Windermere"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper (headless)
+        env:
+          FORM_URL: https://plymouth-self.achieveservice.com/en/AchieveForms/?form_uri=sandbox-publish://AF-Process-31283f9a-3ae7-4225-af71-bf3884e0ac1b/AF-Stagedba4a7d5-e916-46b6-abdb-643d38bec875/definition.json&redirectlink=%2Fen&cancelRedirectLink=%2Fen&consentMessage=yes
+          HEADLESS: "true"
+          DEBUG_PAUSE: "false"
+          CACHE_TTL_HOURS: "0"
+          OUTPUT_DIR: public
+          POSTCODE: ${{ github.event.inputs.postcode }}
+          ADDRESS_HINT: ${{ github.event.inputs.address_hint }}
+        run: python scraper.py
+
+      - name: Upload artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: public/*
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: refresh
+    permissions:
+      pages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
