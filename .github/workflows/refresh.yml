@@ -1,6 +1,7 @@
-name: Refresh bin schedule
+name: Refresh bin schedule & WhatsApp notify
 
 on:
+  # Manual run with inputs
   workflow_dispatch:
     inputs:
       postcode:
@@ -12,12 +13,16 @@ on:
         required: true
         default: "72 Windermere"
 
-  # 🕒 Auto-refresh every night at 02:15 UTC (03:15 UK time in winter)
+  # 🕒 Auto-refresh every night at 02:15 UTC (03:15 UK in winter)
   schedule:
     - cron: "15 2 * * *"
+    # 🕔 Daily WhatsApp reminder at 17:00 UTC (18:00 UK in summer)
+    - cron: "0 17 * * *"
 
 jobs:
   refresh:
+    # Run for manual runs and for the 02:15 cron only
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '15 2 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -49,7 +54,7 @@ jobs:
           ADDRESS_HINT_INPUT: ${{ github.event.inputs.address_hint }}
 
           # For scheduled runs (no manual inputs)
-          POSTCODE_DEFAULT: "PL6 5HX"
+          POSTCODE_DEFAULT: "PL6 5 HX"
           ADDRESS_HINT_DEFAULT: "72 Windermere"
         run: |
           # If inputs are missing (schedule), fall back to defaults
@@ -70,6 +75,7 @@ jobs:
           path: public
 
   deploy:
+    if: needs.refresh.result == 'success'
     needs: refresh
     permissions:
       pages: write
@@ -78,3 +84,35 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         uses: actions/deploy-pages@v4
+
+  notify:
+    # Run for the 17:00 cron and also allowed on manual runs
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 17 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Send WhatsApp if tomorrow is a collection day
+        env:
+          # Use your live GitHub Pages JSON (change to latest.json if you add that alias)
+          BIN_JSON_URL: https://jackberryman.github.io/plymouth-bin-scraper/PL6_5HX_72_Windermere.json
+
+          # Twilio secrets — add these in Repo → Settings → Secrets and variables → Actions
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}   # e.g. whatsapp:+14155238886
+          TWILIO_WHATSAPP_TO: ${{ secrets.TWILIO_WHATSAPP_TO }}       # e.g. whatsapp:+447969513470
+        run: python notify.py
