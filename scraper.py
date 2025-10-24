@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Scrapes Plymouth Council's "Waste - Check your bin day" AchieveForms page with Playwright,
-parses the visible results into per-service dates, filters out the line "Today's date:",
-and writes JSON + ICS files into /public.
+Scrapes Plymouth Council's "Waste - Check your bin day" (AchieveForms) with Playwright,
+parses visible results into per-service dates, filters out the "Today's date" line,
+and writes JSON + ICS to /public.
 
-ENV (optional):
-  FORM_URL        - AchieveForms URL (default points to Plymouth "Check your bin day")
-  HEADLESS        - "true"/"false" (default true)
-  DEBUG_PAUSE     - "true" to open Playwright Inspector before interacting (default false)
-  OUTPUT_DIR      - output folder (default "public")
-  POSTCODE        - postcode to search (e.g., "PL6 5HX")
-  ADDRESS_HINT    - free-text address match (e.g., "72 Windermere")
-  POSTCODE_INPUT / ADDRESS_HINT_INPUT / *_DEFAULT are also respected (for Actions)
+ENV (optional)
+--------------
+FORM_URL        - AchieveForms URL (defaults to Plymouth "Check your bin day")
+HEADLESS        - "true"/"false" (default true)
+DEBUG_PAUSE     - "true" to open Playwright Inspector before interacting (default false)
+OUTPUT_DIR      - output folder (default "public")
+
+POSTCODE / ADDRESS_HINT                            (preferred)
+POSTCODE_INPUT / ADDRESS_HINT_INPUT                (manual workflow inputs)
+POSTCODE_DEFAULT / ADDRESS_HINT_DEFAULT            (scheduled workflow defaults)
 """
 
 import asyncio
@@ -25,6 +27,7 @@ from typing import Dict, List, Optional, Tuple
 
 from dateutil.tz import gettz
 from ics import Calendar, Event
+from ics.grammar.parse import ContentLine
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # -----------------------------------
@@ -247,7 +250,8 @@ def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
 
 def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]]) -> str:
     cal = Calendar()
-    cal.extra.append(["X-WR-CALNAME", f"Bin collections — {postcode} — {address_hint}"])
+    # Proper extra header line for ics>=0.7.x
+    cal.extra.append(ContentLine(name="X-WR-CALNAME", value=f"Bin collections — {postcode} — {address_hint}"))
 
     titles = {
         "refuse": "Refuse (brown bin)",
