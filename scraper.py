@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 from dateutil.tz import gettz
 from ics import Calendar, Event
 from ics.grammar.parse import ContentLine
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Frame
 
 # -----------------------------------
 # Config
@@ -51,6 +51,8 @@ DATE_PATTERNS = (
     r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s*\d{2}/\d{2}/\d{4}\b",
     r"\b\d{2}/\d{2}/\d{4}\b",
 )
+
+DATE_ANY_REGEX = re.compile(DATE_PATTERNS[1])  # for quick presence checks
 
 # Service section keywords (used to attribute dates)
 SERVICE_KEYWORDS = {
@@ -112,7 +114,7 @@ class ScrapeResult:
 # Playwright: drive the form
 # -----------------------------------
 
-async def run_form(page, form_url: str, postcode: str, address_hint: str) -> None:
+async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Frame:
     await page.goto(form_url, wait_until="domcontentloaded")
     print(f">>> Page URL: {page.url}")
 
@@ -191,18 +193,21 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Non
         await form_frame.get_by_text(re.compile(r"\b\d{2}/\d{2}/\d{4}\b")).wait_for(timeout=30000)
     print(">>> Dates detected in results.")
 
+    return form_frame
+
 # -----------------------------------
 # Extract + parse text
 # -----------------------------------
 
-async def extract_text_content(page) -> str:
-    fr = next((f for f in page.frames if "/fillform/" in f.url), None)
-    if not fr:
-        raise RuntimeError("Fillform frame not found when extracting text.")
-
-    # Pull all visible text (line-by-line)
-    content = await fr.evaluate(
-        """
+async def extract_text_content(form_frame: Frame) -> str:
+    """
+    Get all visible text from the SAME frame we interacted with.
+    Ensure at least one DD/MM/YYYY is present (with a small wait loop).
+    """
+    # poll up to ~5s for a date to actually render in the DOM text
+    for _ in range(10):
+        content = await form_frame.evaluate(
+            """
 () => {
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   const out = [];
@@ -213,7 +218,12 @@ async def extract_text_content(page) -> str:
   return out.join("\\n");
 }
 """
-    )
+        )
+        if DATE_ANY_REGEX.search(content):
+            return content
+        await form_frame.wait_for_timeout(500)
+
+    # last try, return whatever we have (debug prints will help)
     return content
 
 def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
@@ -285,8 +295,15 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
         if env_bool("DEBUG_PAUSE", False):
             await page.pause()
 
-        await run_form(page, form_url, postcode, address_hint)
-        text_blob = await extract_text_content(page)
+        form_frame = await run_form(page, form_url, postcode, address_hint)
+        text_blob = await extract_text_content(form_frame)
+
+        if not DATE_ANY_REGEX.search(text_blob):
+            # Helpful diagnostics if parsing appears blank
+            preview = "\n".join(text_blob.splitlines()[:40])
+            print(">>> WARNING: no DD/MM/YYYY detected in extracted text. Preview:")
+            print(preview)
+
         collections = parse_collections_from_text(text_blob)
 
         await browser.close()
