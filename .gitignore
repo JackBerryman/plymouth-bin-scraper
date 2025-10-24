@@ -1,0 +1,17 @@
+# Virtual environment and caches
+.venv/
+__pycache__/
+*.pyc
+.cache/
+
+# Local environment
+.env
+
+# Local run artifacts
+cache.sqlite
+debug.png
+debug.html
+
+# Build output
+public/
+!public/.keep
