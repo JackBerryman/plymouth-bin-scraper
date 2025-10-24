@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Plymouth Bin Collections</title>
+<style>
+  body{font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:2rem;max-width:780px}
+  h1{margin:0 0 .25rem}
+  .muted{color:#6b7280;margin:0 0 1rem}
+  .card{border:1px solid #e5e7eb;border-radius:16px;padding:1rem;margin:.75rem 0;box-shadow:0 1px 4px rgba(0,0,0,.04)}
+  .pill{display:inline-block;border:1px solid #e5e7eb;border-radius:999px;padding:.25rem .6rem;margin:.2rem .3rem 0 0;background:#f9fafb}
+  a{color:#0366d6;text-decoration:none}
+  a:hover{text-decoration:underline}
+</style>
+<h1>Bin collections</h1>
+<p class="muted" id="addr">Loading…</p>
+
+<div class="card">
+  <strong>Downloads</strong>
+  <div>
+    <a id="jsonLink" href="#">JSON</a> ·
+    <a id="icsLink" href="#">Calendar (.ics)</a>
+  </div>
+</div>
+
+<div class="card" id="refuse"><strong>Refuse (brown)</strong><div id="refuseDates"></div></div>
+<div class="card" id="recycling"><strong>Recycling (green)</strong><div id="recyclingDates"></div></div>
+<div class="card" id="garden"><strong>Garden waste</strong><div id="gardenDates"></div></div>
+
+<script>
+(async function () {
+  const pc = "PL6_5HX";           // match your file names
+  const hint = "72_Windermere";   // match your file names
+  const base = location.origin + location.pathname.replace(/\/$/, "");
+  const jsonUrl = `${base}/${pc}_${hint}.json`;
+
+  document.getElementById("jsonLink").href = `${pc}_${hint}.json`;
+  document.getElementById("icsLink").href = `${pc}_${hint}.ics`;
+
+  const fmt = d => new Date(d).toLocaleDateString("en-GB",{weekday:"short", day:"2-digit", month:"short", year:"numeric"});
+  const add = (id, arr) => {
+    const wrap = document.getElementById(id+"Dates");
+    wrap.innerHTML = (arr && arr.length) ? arr.slice(0,6).map(x=>`<span class="pill">${fmt(x)}</span>`).join("") : "<span class='muted'>No dates</span>";
+  };
+
+  const res = await fetch(jsonUrl);
+  const data = await res.json();
+  document.getElementById("addr").textContent = `${data.postcode} — ${data.address_hint}`;
+  add("refuse", data.collections.refuse);
+  add("recycling", data.collections.recycling);
+  add("garden", data.collections.garden);
+})().catch(e => {
+  document.body.insertAdjacentHTML("beforeend", `<pre>${String(e)}</pre>`);
+});
+</script>
+</html>
