@@ -12,6 +12,10 @@ on:
         required: true
         default: "72 Windermere"
 
+  # 🕒 Auto-refresh every night at 02:15 UTC (03:15 UK time in winter)
+  schedule:
+    - cron: "15 2 * * *"
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -39,9 +43,20 @@ jobs:
           DEBUG_PAUSE: "false"
           CACHE_TTL_HOURS: "0"
           OUTPUT_DIR: public
-          POSTCODE: ${{ github.event.inputs.postcode }}
-          ADDRESS_HINT: ${{ github.event.inputs.address_hint }}
-        run: python scraper.py
+
+          # For manual runs (from "Run workflow" button)
+          POSTCODE_INPUT: ${{ github.event.inputs.postcode }}
+          ADDRESS_HINT_INPUT: ${{ github.event.inputs.address_hint }}
+
+          # For scheduled runs (no manual inputs)
+          POSTCODE_DEFAULT: "PL6 5HX"
+          ADDRESS_HINT_DEFAULT: "72 Windermere"
+        run: |
+          # If inputs are missing (schedule), fall back to defaults
+          export POSTCODE="${POSTCODE_INPUT:-$POSTCODE_DEFAULT}"
+          export ADDRESS_HINT="${ADDRESS_HINT_INPUT:-$ADDRESS_HINT_DEFAULT}"
+
+          python scraper.py
 
       - name: Upload artifact (optional)
         uses: actions/upload-artifact@v4
