@@ -1,7 +1,6 @@
 name: Refresh bin schedule & WhatsApp notify
 
 on:
-  # Manual run with inputs
   workflow_dispatch:
     inputs:
       postcode:
@@ -13,19 +12,14 @@ on:
         required: true
         default: "72 Windermere"
 
-  # 🕒 Auto-refresh every night at 02:15 UTC (03:15 UK in winter)
+  # Nightly refresh of JSON/ICS
   schedule:
     - cron: "15 2 * * *"
-    # 🕔 Daily WhatsApp reminder at 17:00 UTC (18:00 UK in summer)
-    - cron: "0 17 * * *"
 
 jobs:
   refresh:
-    # Run for manual runs and for the 02:15 cron only
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '15 2 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -46,28 +40,17 @@ jobs:
           FORM_URL: https://plymouth-self.achieveservice.com/en/AchieveForms/?form_uri=sandbox-publish://AF-Process-31283f9a-3ae7-4225-af71-bf3884e0ac1b/AF-Stagedba4a7d5-e916-46b6-abdb-643d38bec875/definition.json&redirectlink=%2Fen&cancelRedirectLink=%2Fen&consentMessage=yes
           HEADLESS: "true"
           DEBUG_PAUSE: "false"
-          CACHE_TTL_HOURS: "0"
           OUTPUT_DIR: public
-
-          # For manual runs (from "Run workflow" button)
+          # manual run inputs
           POSTCODE_INPUT: ${{ github.event.inputs.postcode }}
           ADDRESS_HINT_INPUT: ${{ github.event.inputs.address_hint }}
-
-          # For scheduled runs (no manual inputs)
-          POSTCODE_DEFAULT: "PL6 5 HX"
+          # scheduled defaults
+          POSTCODE_DEFAULT: "PL6 5HX"
           ADDRESS_HINT_DEFAULT: "72 Windermere"
         run: |
-          # If inputs are missing (schedule), fall back to defaults
           export POSTCODE="${POSTCODE_INPUT:-$POSTCODE_DEFAULT}"
           export ADDRESS_HINT="${ADDRESS_HINT_INPUT:-$ADDRESS_HINT_DEFAULT}"
-
           python scraper.py
-
-      - name: Upload artifact (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: outputs
-          path: public/*
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
@@ -75,7 +58,6 @@ jobs:
           path: public
 
   deploy:
-    if: needs.refresh.result == 'success'
     needs: refresh
     permissions:
       pages: write
@@ -86,13 +68,12 @@ jobs:
         uses: actions/deploy-pages@v4
 
   notify:
-    # Run for the 17:00 cron and also allowed on manual runs
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 17 * * *'
+    # WAIT for deploy to finish, then send WhatsApp
+    needs: deploy
+    if: ${{ always() && (needs.refresh.result == 'success') && (needs.deploy.result == 'success') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -100,19 +81,33 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install deps
+      - name: Install notify deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Wait for GitHub Pages to serve the new JSON (retry)
+        env:
+          JSON_URL: https://jackberryman.github.io/plymouth-bin-scraper/PL6_5HX_72_Windermere.json
+        run: |
+          echo "Probing $JSON_URL until it returns 200..."
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$JSON_URL")
+            if [ "$code" = "200" ]; then
+              echo "OK (200) after $i attempt(s)."
+              exit 0
+            fi
+            echo "Attempt $i: got $code, retrying in 10s…"
+            sleep 10
+          done
+          echo "JSON never appeared in time."
+          exit 1
+
       - name: Send WhatsApp if tomorrow is a collection day
         env:
-          # Use your live GitHub Pages JSON (change to latest.json if you add that alias)
           BIN_JSON_URL: https://jackberryman.github.io/plymouth-bin-scraper/PL6_5HX_72_Windermere.json
-
-          # Twilio secrets — add these in Repo → Settings → Secrets and variables → Actions
           TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
-          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
-          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}   # e.g. whatsapp:+14155238886
-          TWILIO_WHATSAPP_TO: ${{ secrets.TWILIO_WHATSAPP_TO }}       # e.g. whatsapp:+447969513470
+          TWILIO_AUTH_TOKEN:  ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_WHATSAPP_FROM: "whatsapp:+14155238886"
+          WHATSAPP_TO: "whatsapp:+44YOURNUMBER"
         run: python notify.py
