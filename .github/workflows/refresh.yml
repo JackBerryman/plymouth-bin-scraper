@@ -14,7 +14,7 @@ on:
 
   # Nightly refresh of JSON/ICS
   schedule:
-    - cron: "15 2 * * *"
+    - cron: "15 8 * * *"
 
 jobs:
   refresh:
