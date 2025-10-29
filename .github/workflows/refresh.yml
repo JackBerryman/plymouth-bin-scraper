@@ -12,14 +12,20 @@ on:
         required: true
         default: "72 Windermere"
 
-  # Nightly refresh of JSON/ICS
+  # Daily run at 17:15 UTC
   schedule:
     - cron: "15 17 * * *"
+
+# Avoid overlapping runs
+concurrency:
+  group: pages-build-and-notify
+  cancel-in-progress: true
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -41,7 +47,7 @@ jobs:
           HEADLESS: "true"
           DEBUG_PAUSE: "false"
           OUTPUT_DIR: public
-          # manual run inputs
+          # manual-run inputs
           POSTCODE_INPUT: ${{ github.event.inputs.postcode }}
           ADDRESS_HINT_INPUT: ${{ github.event.inputs.address_hint }}
           # scheduled defaults
@@ -59,19 +65,19 @@ jobs:
 
   deploy:
     needs: refresh
+    runs-on: ubuntu-latest
     permissions:
       pages: write
       id-token: write
-    runs-on: ubuntu-latest
     steps:
       - name: Deploy to GitHub Pages
         uses: actions/deploy-pages@v4
 
   notify:
-    # WAIT for deploy to finish, then send WhatsApp
     needs: deploy
     if: ${{ always() && (needs.refresh.result == 'success') && (needs.deploy.result == 'success') }}
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -108,6 +114,6 @@ jobs:
           BIN_JSON_URL: https://jackberryman.github.io/plymouth-bin-scraper/PL6_5HX_72_Windermere.json
           TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
           TWILIO_AUTH_TOKEN:  ${{ secrets.TWILIO_AUTH_TOKEN }}
-          TWILIO_WHATSAPP_FROM: "whatsapp:+14155238886"
-          WHATSAPP_TO: "whatsapp:+44YOURNUMBER"
+          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+          TWILIO_WHATSAPP_TO:  ${{ secrets.TWILIO_WHATSAPP_TO }}
         run: python notify.py
