@@ -1,61 +1,106 @@
 #!/usr/bin/env python3
 """
-notify.py — reads your published JSON and sends a WhatsApp reminder via Twilio.
-Includes a FORCE_SEND test hook you can trigger via workflow input or env var.
+notify.py — checks your Plymouth bin schedule (from GitHub Pages)
+and sends a WhatsApp reminder via Twilio if tomorrow has a collection.
+
+Set FORCE_SEND=true in the workflow inputs/env to send a test ping even if
+there's no collection tomorrow.
 """
 
-import os, json
+import os
+import json
 from datetime import datetime, timedelta
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+from urllib.parse import urlencode
 from base64 import b64encode
 
 try:
-    from zoneinfo import ZoneInfo  # 3.9+
+    from zoneinfo import ZoneInfo  # Python 3.9+
 except ImportError:
     ZoneInfo = None
 
-# -------- helpers --------
-def truthy(s: str) -> bool:
-    if s is None:
-        return False
-    return str(s).strip().lower() in {"1", "true", "yes", "y", "on"}
+# ---- CONFIG ----
+BIN_JSON_URL = os.getenv("BIN_JSON_URL", "").strip()
+LOCAL_JSON_PATH = "public/PL6_5HX_72_Windermere.json"  # fallback path
+
+# Twilio credentials (from GitHub Secrets or local .env)
+TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID") or os.getenv("TWILIO_SID")
+TWILIO_AUTH = os.getenv("TWILIO_AUTH_TOKEN")
+WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+# Accept either TWILIO_WHATSAPP_TO or WHATSAPP_TO
+WHATSAPP_TO = (
+    os.getenv("TWILIO_WHATSAPP_TO")
+    or os.getenv("WHATSAPP_TO")
+    or os.getenv("TO_NUMBER")
+)
+
+FORCE_SEND = os.getenv("FORCE_SEND", "").lower() in {"1", "true", "yes"}
 
 UK_TZ = ZoneInfo("Europe/London") if ZoneInfo else None
 
+
 def now_uk_date():
+    """Return today's date in UK timezone (handles BST/GMT)."""
     if UK_TZ:
         return datetime.now(UK_TZ).date()
     return datetime.utcnow().date()
 
-def fetch_json(url: str, local_fallback: str):
-    if url:
-        print(f">>> Fetching live data from {url}")
-        req = Request(url, headers={"User-Agent": "bins-notifier/1.0"})
+
+def fetch_json():
+    """Fetch JSON from GitHub Pages or fallback to local file."""
+    if BIN_JSON_URL:
+        print(f">>> Fetching live data from {BIN_JSON_URL}")
+        req = Request(BIN_JSON_URL, headers={"User-Agent": "bins-notifier/1.0"})
         try:
             with urlopen(req, timeout=20) as r:
                 return json.loads(r.read().decode("utf-8"))
         except HTTPError as e:
-            raise SystemExit(f"HTTP error fetching {url}: {e.code} {e.reason}")
+            raise SystemExit(f"HTTP error fetching {BIN_JSON_URL}: {e.code} {e.reason}")
         except URLError as e:
-            raise SystemExit(f"Network error fetching {url}: {e.reason}")
-    print(f">>> Using local data from {local_fallback}")
-    with open(local_fallback, "r", encoding="utf-8") as f:
+            raise SystemExit(f"Network error fetching {BIN_JSON_URL}: {e.reason}")
+    print(f">>> Using local data from {LOCAL_JSON_PATH}")
+    with open(LOCAL_JSON_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def send_whatsapp(account_sid: str, auth_token: str, from_whatsapp: str, to_whatsapp: str, body: str):
-    if not (account_sid and auth_token and to_whatsapp):
+
+def normalize_whatsapp(num: str) -> str:
+    """Ensure number has whatsapp:+ prefix."""
+    n = (num or "").strip()
+    if not n:
+        return n
+    if not n.startswith("whatsapp:"):
+        n = "whatsapp:" + n
+    if not n.startswith("whatsapp:+"):
+        # handle 'whatsapp:447...' -> 'whatsapp:+447...'
+        if n.startswith("whatsapp:") and not n[len("whatsapp:"):].startswith("+"):
+            n = "whatsapp:+" + n[len("whatsapp:"):]
+    return n
+
+
+def send_whatsapp(body: str):
+    """Send WhatsApp message using Twilio API (properly URL-encoded)."""
+    to = normalize_whatsapp(WHATSAPP_TO)
+    from_ = normalize_whatsapp(WHATSAPP_FROM)
+
+    if not (TWILIO_SID and TWILIO_AUTH and to):
         raise SystemExit(
             "Missing Twilio env vars: need TWILIO_ACCOUNT_SID (or TWILIO_SID), "
-            "TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_TO (or TO_NUMBER)"
+            "TWILIO_AUTH_TOKEN, and TWILIO_WHATSAPP_TO (or WHATSAPP_TO/TO_NUMBER)."
         )
-    api = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
-    payload = f"From={from_whatsapp}&To={to_whatsapp}&Body={body}".encode("utf-8")
-    auth = b64encode(f"{account_sid}:{auth_token}".encode()).decode()
-    req = Request(api, data=payload, method="POST", headers={
+
+    api = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json"
+
+    # IMPORTANT: url-encode so '+' is preserved as %2B (not turned into a space)
+    form = urlencode({"From": from_, "To": to, "Body": body}).encode("utf-8")
+
+    auth = b64encode(f"{TWILIO_SID}:{TWILIO_AUTH}".encode()).decode()
+    req = Request(api, data=form, method="POST", headers={
         "Authorization": f"Basic {auth}",
-        "Content-Type": "application/x-www-form-urlencoded"
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "bins-notifier/1.0",
     })
+
     try:
         with urlopen(req, timeout=20) as resp:
             print(">>> Twilio:", resp.status, resp.read().decode("utf-8"))
@@ -65,46 +110,19 @@ def send_whatsapp(account_sid: str, auth_token: str, from_whatsapp: str, to_what
     except URLError as e:
         raise SystemExit(f"Twilio network error: {e.reason}")
 
-# -------- main --------
+
 def main():
-    # Inputs / env
-    bin_json_url   = os.getenv("BIN_JSON_URL", "").strip()
-    local_json     = "public/PL6_5HX_72_Windermere.json"
+    data = fetch_json()
+    postcode = data.get("postcode", "")
+    hint = data.get("address_hint", "")
+    collections = data.get("collections", {})
 
-    # Twilio envs (support both naming styles)
-    sid            = os.getenv("TWILIO_ACCOUNT_SID") or os.getenv("TWILIO_SID")
-    token          = os.getenv("TWILIO_AUTH_TOKEN")
-    from_whatsapp  = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
-    to_whatsapp    = os.getenv("TWILIO_WHATSAPP_TO") or os.getenv("TO_NUMBER")
+    today = now_uk_date()
+    tomorrow = today + timedelta(days=1)
 
-    # Test hook
-    force_send     = truthy(os.getenv("FORCE_SEND"))
-    test_text      = os.getenv("TEST_TEXT", "Test: bin reminder pipeline works ✅")
-
-    # Debug (safe) log
-    print(f">>> FORCE_SEND={force_send}  BIN_JSON_URL={'set' if bin_json_url else 'unset'}")
-    print(f">>> Twilio: SID={'set' if sid else 'unset'}  FROM={from_whatsapp}  TO={'set' if to_whatsapp else 'unset'}")
-
-    data = fetch_json(bin_json_url, local_json)
-    postcode  = data.get("postcode", "")
-    hint      = data.get("address_hint", "")
-    colls     = data.get("collections", {})
-
-    today     = now_uk_date()
-    tomorrow  = today + timedelta(days=1)
-
-    # FORCE SEND branch
-    if force_send:
-        body = f"{test_text}\n({postcode} — {hint})"
-        print(">>> FORCE_SEND on — sending test WhatsApp:")
-        print(body)
-        send_whatsapp(sid, token, from_whatsapp, to_whatsapp, body)
-        print(">>> Test message sent ✓")
-        return
-
-    # Normal path: find tomorrow’s bins
+    # Gather tomorrow’s bins
     services = []
-    for key, arr in (colls or {}).items():
+    for key, arr in collections.items():
         for s in (arr or []):
             try:
                 d = datetime.strptime(s, "%Y-%m-%d").date()
@@ -118,18 +136,33 @@ def main():
                 }.get(key, key.title())
                 services.append(label)
 
+    # Always allow a manual test if FORCE_SEND is on
+    if FORCE_SEND:
+        test = f"Test ping from workflow at {int(datetime.utcnow().timestamp())} ✅"
+        body = f"{test}\n\n({postcode} — {hint})"
+        print(">>> FORCE_SEND on — sending test WhatsApp:")
+        print(body)
+        send_whatsapp(body)
+        print(">>> Test message sent ✓")
+        return
+
     if not services:
         print(">>> No collections tomorrow — no WhatsApp sent.")
         return
 
     nice_date = tomorrow.strftime("%A %d %B")
-    body = "Bin reminder for {pc} — {hint}\nTomorrow ({date}):\n{lines}".format(
-        pc=postcode, hint=hint, date=nice_date,
-        lines="\n".join(f"• {s}" for s in services)
-    )
+    lines = [
+        f"Bin reminder for {postcode} — {hint}",
+        f"Tomorrow ({nice_date}):",
+        *[f"• {s}" for s in services],
+    ]
+    body = "\n".join(lines)
     print(">>> Sending WhatsApp message:\n" + body)
-    send_whatsapp(sid, token, from_whatsapp, to_whatsapp, body)
-    print(">>> Message sent ✓")
+    send_whatsapp(body)
+    print(">>> Reminder sent ✓")
+
 
 if __name__ == "__main__":
+    print(f">>> FORCE_SEND={FORCE_SEND}  BIN_JSON_URL={'set' if BIN_JSON_URL else 'unset'}")
+    print(f">>> Twilio: SID={'set' if TWILIO_SID else 'unset'}  FROM={'***' if WHATSAPP_FROM else 'unset'}  TO={'set' if WHATSAPP_TO else 'unset'}")
     main()
