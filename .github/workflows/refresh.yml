@@ -11,6 +11,10 @@ on:
         description: "Address hint (e.g., 72 Windermere)"
         required: true
         default: "72 Windermere"
+      force_send:
+        description: "Send a test WhatsApp now (ignores schedule)"
+        required: false
+        default: "false"
 
   # Daily run at 17:15 UTC
   schedule:
@@ -116,4 +120,6 @@ jobs:
           TWILIO_AUTH_TOKEN:  ${{ secrets.TWILIO_AUTH_TOKEN }}
           TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
           TWILIO_WHATSAPP_TO:  ${{ secrets.TWILIO_WHATSAPP_TO }}
+          FORCE_SEND: ${{ github.event.inputs.force_send }}
+          TEST_TEXT: "Test ping from workflow at ${{ github.run_id }} ✅"
         run: python notify.py
