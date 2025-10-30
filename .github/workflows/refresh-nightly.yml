@@ -1,0 +1,63 @@
+name: Nightly bin data refresh (no WhatsApp)
+
+on:
+  # Runs every night at 02:15 UTC
+  schedule:
+    - cron: "15 2 * * *"
+  # Handy for manual checks
+  workflow_dispatch:
+
+# Avoid clashing page deployments if two workflows overlap
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper (headless)
+        env:
+          FORM_URL: https://plymouth-self.achieveservice.com/en/AchieveForms/?form_uri=sandbox-publish://AF-Process-31283f9a-3ae7-4225-af71-bf3884e0ac1b/AF-Stagedba4a7d5-e916-46b6-abdb-643d38bec875/definition.json&redirectlink=%2Fen&cancelRedirectLink=%2Fen&consentMessage=yes
+          HEADLESS: "true"
+          DEBUG_PAUSE: "false"
+          OUTPUT_DIR: public
+
+          # Defaults for unattended runs
+          POSTCODE_DEFAULT: "PL6 5HX"
+          ADDRESS_HINT_DEFAULT: "72 Windermere"
+        run: |
+          export POSTCODE="$POSTCODE_DEFAULT"
+          export ADDRESS_HINT="$ADDRESS_HINT_DEFAULT"
+          python scraper.py
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: refresh
+    permissions:
+      pages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
