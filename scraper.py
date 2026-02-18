@@ -51,30 +51,30 @@ DATE_PATTERNS = (
     r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s*\d{2}/\d{2}/\d{4}\b",
     r"\b\d{2}/\d{2}/\d{4}\b",
 )
-
 DATE_ANY_REGEX = re.compile(DATE_PATTERNS[1])  # for quick presence checks
 
 # Service section keywords (used to attribute dates)
-# Tightened to avoid false matches.
 SERVICE_KEYWORDS = {
     "refuse": (
         "brown domestic bin",
-        "brown bin",
+        "brown household bin",
+        "domestic bin",
         "refuse",
+        "general waste",
+        "brown bin",
     ),
     "recycling": (
         "green recycling bin",
-        "recycling bin",
         "recycling",
+        "green bin",
     ),
     "garden": (
         "garden waste bin",
         "garden waste",
+        "garden",
+        "green garden bin",
     ),
 }
-
-# How far back we search from a date line to find the nearest service heading.
-LOOKBACK_LINES_FOR_SERVICE = 8
 
 # -----------------------------------
 # Helpers
@@ -99,16 +99,12 @@ def ddmmyyyy_to_iso(text: str) -> Optional[str]:
     except ValueError:
         return None
 
-def classify_service_from_text(line: str) -> Optional[str]:
-    """
-    Returns a service key if this line looks like a service heading.
-    (We keep it strict to avoid accidental matches.)
-    """
+def classify_service_from_text(line: str, current: Optional[str]) -> Optional[str]:
     t = line.lower()
     for svc, keys in SERVICE_KEYWORDS.items():
         if any(k in t for k in keys):
             return svc
-    return None
+    return current
 
 @dataclass
 class ScrapeResult:
@@ -127,7 +123,7 @@ class ScrapeResult:
 
     def sort_dedupe(self):
         for k, arr in self.collections.items():
-            arr[:] = sorted(sorted(set(arr)))
+            arr[:] = sorted(set(arr))
 
 # -----------------------------------
 # Playwright: drive the form
@@ -185,10 +181,13 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     select = form_frame.get_by_role("combobox").first
     await select.wait_for(state="visible", timeout=30000)
 
-    # Log a few options
-    all_texts = await select.all_inner_texts()
-    first = all_texts[0] if all_texts else ""
-    print(f">>> Address options (first few): {first.splitlines()[:5]} ...")
+    # Log a few options (best-effort)
+    try:
+        all_texts = await select.all_inner_texts()
+        first = all_texts[0] if all_texts else ""
+        print(f">>> Address options (first few): {first.splitlines()[:5]} ...")
+    except Exception:
+        pass
 
     # Pick best match, else first non-placeholder
     opt_xpath = (
@@ -199,11 +198,11 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     if await options.count():
         value = await options.first.get_attribute("value")
         await select.select_option(value=value)
-        chosen = await options.first.inner_text()
+        chosen = (await options.first.inner_text()).strip()
     else:
         await select.select_option(index=1)
-        chosen = await select.input_value()
-    print(f">>> Selected address: {chosen.strip()}")
+        chosen = (await select.input_value()).strip()
+    print(f">>> Selected address: {chosen}")
 
     # Wait until Collection Details (or any date) appears
     try:
@@ -220,73 +219,58 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
 
 async def extract_text_content(form_frame: Frame) -> str:
     """
-    Get all visible text from the SAME frame we interacted with.
-    Ensure at least one DD/MM/YYYY is present (with a small wait loop).
+    Extract visible text with preserved line breaks.
+    IMPORTANT: use innerText (not raw text nodes), otherwise headings + bullet lists
+    can collapse into the same 'line' and break service/date attribution.
     """
     content = ""
-    for _ in range(10):
+
+    # poll up to ~8s for dates to be present in innerText
+    for _ in range(16):
         content = await form_frame.evaluate(
-            """
-() => {
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  const out = [];
-  while (walker.nextNode()) {
-    const t = walker.currentNode.nodeValue;
-    if (t && t.trim()) out.push(t.trim());
-  }
-  return out.join("\\n");
-}
-"""
+            "() => (document.body && document.body.innerText) ? document.body.innerText : ''"
         )
+        if content:
+            content = content.replace("\r\n", "\n").strip()
         if DATE_ANY_REGEX.search(content):
             return content
         await form_frame.wait_for_timeout(500)
 
-    return content
-
-def _nearest_service_for_date(lines: List[str], idx: int) -> Optional[str]:
-    """
-    Given a date line at lines[idx], scan backwards up to LOOKBACK_LINES_FOR_SERVICE
-    to find the nearest service heading. This avoids relying on the exact DOM text order.
-    """
-    start = max(0, idx - LOOKBACK_LINES_FOR_SERVICE)
-    for j in range(idx, start - 1, -1):
-        svc = classify_service_from_text(lines[j])
-        if svc:
-            return svc
-    return None
+    return (content or "").replace("\r\n", "\n").strip()
 
 def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
-    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
-    collections = {"refuse": [], "recycling": [], "garden": []}
+    # Keep empty lines out, but preserve order
+    lines = [ln.strip() for ln in full_text.splitlines() if ln and ln.strip()]
+    collections: Dict[str, List[str]] = {"refuse": [], "recycling": [], "garden": []}
+    current_service: Optional[str] = None
     re_dates = [re.compile(p) for p in DATE_PATTERNS]
 
-    for i, ln in enumerate(lines):
+    for ln in lines:
+        # ignore "Today's date: ..."
         if RE_TODAY_LINE.search(ln):
             continue
 
-        # Extract all date strings from this line
+        # update service context if this line looks like a heading/label
+        current_service = classify_service_from_text(ln, current_service)
+
+        # extract date strings from the line
         matches: List[str] = []
         for rx in re_dates:
             matches.extend(rx.findall(ln))
 
-        if not matches:
-            continue
-
-        # Attribute these dates to the nearest service heading above this line
-        svc = _nearest_service_for_date(lines, i)
-        if not svc or svc not in collections:
+        # if we don't currently know what service we're in, don't guess
+        if not current_service:
             continue
 
         for raw in matches:
             iso = ddmmyyyy_to_iso(raw)
             if not iso:
                 continue
-            if iso not in collections[svc]:
-                collections[svc].append(iso)
+            if iso not in collections[current_service]:
+                collections[current_service].append(iso)
 
     for k in collections.keys():
-        collections[k] = sorted(sorted(set(collections[k])))
+        collections[k] = sorted(set(collections[k]))
 
     return collections
 
@@ -334,12 +318,11 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
         text_blob = await extract_text_content(form_frame)
 
         if not DATE_ANY_REGEX.search(text_blob):
-            preview = "\n".join(text_blob.splitlines()[:40])
+            preview = "\n".join(text_blob.splitlines()[:80])
             print(">>> WARNING: no DD/MM/YYYY detected in extracted text. Preview:")
             print(preview)
 
         collections = parse_collections_from_text(text_blob)
-
         await browser.close()
 
     res = ScrapeResult(postcode=postcode, address_hint=address_hint, collections=collections)
