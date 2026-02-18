@@ -55,11 +55,26 @@ DATE_PATTERNS = (
 DATE_ANY_REGEX = re.compile(DATE_PATTERNS[1])  # for quick presence checks
 
 # Service section keywords (used to attribute dates)
+# Tightened to avoid false matches.
 SERVICE_KEYWORDS = {
-    "refuse": ("brown domestic bin", "domestic bin", "refuse"),
-    "recycling": ("green recycling bin", "recycling"),
-    "garden": ("garden waste bin", "garden"),
+    "refuse": (
+        "brown domestic bin",
+        "brown bin",
+        "refuse",
+    ),
+    "recycling": (
+        "green recycling bin",
+        "recycling bin",
+        "recycling",
+    ),
+    "garden": (
+        "garden waste bin",
+        "garden waste",
+    ),
 }
+
+# How far back we search from a date line to find the nearest service heading.
+LOOKBACK_LINES_FOR_SERVICE = 8
 
 # -----------------------------------
 # Helpers
@@ -71,10 +86,8 @@ def env_bool(name: str, default: bool = False) -> bool:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y"}
 
-
 def sanitize_filename(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", s)
-
 
 def ddmmyyyy_to_iso(text: str) -> Optional[str]:
     """Extract first DD/MM/YYYY inside text and return as YYYY-MM-DD."""
@@ -86,14 +99,16 @@ def ddmmyyyy_to_iso(text: str) -> Optional[str]:
     except ValueError:
         return None
 
-
-def classify_service_from_text(line: str, current: Optional[str]) -> Optional[str]:
+def classify_service_from_text(line: str) -> Optional[str]:
+    """
+    Returns a service key if this line looks like a service heading.
+    (We keep it strict to avoid accidental matches.)
+    """
     t = line.lower()
     for svc, keys in SERVICE_KEYWORDS.items():
         if any(k in t for k in keys):
             return svc
-    return current
-
+    return None
 
 @dataclass
 class ScrapeResult:
@@ -113,7 +128,6 @@ class ScrapeResult:
     def sort_dedupe(self):
         for k, arr in self.collections.items():
             arr[:] = sorted(sorted(set(arr)))
-
 
 # -----------------------------------
 # Playwright: drive the form
@@ -200,7 +214,6 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
 
     return form_frame
 
-
 # -----------------------------------
 # Extract + parse text
 # -----------------------------------
@@ -210,7 +223,6 @@ async def extract_text_content(form_frame: Frame) -> str:
     Get all visible text from the SAME frame we interacted with.
     Ensure at least one DD/MM/YYYY is present (with a small wait loop).
     """
-    # poll up to ~5s for a date to actually render in the DOM text
     content = ""
     for _ in range(10):
         content = await form_frame.evaluate(
@@ -230,69 +242,41 @@ async def extract_text_content(form_frame: Frame) -> str:
             return content
         await form_frame.wait_for_timeout(500)
 
-    # last try, return whatever we have (debug prints will help)
     return content
 
+def _nearest_service_for_date(lines: List[str], idx: int) -> Optional[str]:
+    """
+    Given a date line at lines[idx], scan backwards up to LOOKBACK_LINES_FOR_SERVICE
+    to find the nearest service heading. This avoids relying on the exact DOM text order.
+    """
+    start = max(0, idx - LOOKBACK_LINES_FOR_SERVICE)
+    for j in range(idx, start - 1, -1):
+        svc = classify_service_from_text(lines[j])
+        if svc:
+            return svc
+    return None
 
 def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
-    """
-    Minimal robustness fix:
-    DOM text-node order can differ from the visual order, so we attribute dates
-    to the nearest *service heading block* rather than relying on line-by-line
-    'current_service' context.
-
-    This fixes cases where (e.g.) "Brown domestic bin" appears *after* its date
-    in extracted text, which would otherwise mis-attribute that date.
-    """
-    # 1) Clean lines + drop "Today's date" line(s)
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
-    lines = [ln for ln in lines if not RE_TODAY_LINE.search(ln)]
-    text = "\n".join(lines)
-
     collections = {"refuse": [], "recycling": [], "garden": []}
     re_dates = [re.compile(p) for p in DATE_PATTERNS]
 
-    # 2) Find all heading markers in the text
-    markers: List[Tuple[int, str]] = []
-    text_lower = text.lower()
+    for i, ln in enumerate(lines):
+        if RE_TODAY_LINE.search(ln):
+            continue
 
-    for svc, keys in SERVICE_KEYWORDS.items():
-        keys_sorted = sorted(keys, key=len, reverse=True)
-        for k in keys_sorted:
-            for m in re.finditer(re.escape(k), text_lower):
-                markers.append((m.start(), svc))
-
-    # 3) If we can't find any markers, fall back to the old line-based approach
-    if not markers:
-        current_service: Optional[str] = None
-        for ln in lines:
-            current_service = classify_service_from_text(ln, current_service)
-
-            matches: List[str] = []
-            for rx in re_dates:
-                matches.extend(rx.findall(ln))
-
-            for raw in matches:
-                iso = ddmmyyyy_to_iso(raw)
-                if not iso or current_service not in collections:
-                    continue
-                if iso not in collections[current_service]:
-                    collections[current_service].append(iso)
-
-        for k in collections:
-            collections[k] = sorted(set(collections[k]))
-        return collections
-
-    # 4) Sort markers and slice blocks; collect dates within each block
-    markers.sort(key=lambda x: x[0])
-
-    for idx, (start, svc) in enumerate(markers):
-        end = markers[idx + 1][0] if idx + 1 < len(markers) else len(text)
-        block = text[start:end]
-
+        # Extract all date strings from this line
         matches: List[str] = []
         for rx in re_dates:
-            matches.extend(rx.findall(block))
+            matches.extend(rx.findall(ln))
+
+        if not matches:
+            continue
+
+        # Attribute these dates to the nearest service heading above this line
+        svc = _nearest_service_for_date(lines, i)
+        if not svc or svc not in collections:
+            continue
 
         for raw in matches:
             iso = ddmmyyyy_to_iso(raw)
@@ -301,12 +285,10 @@ def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
             if iso not in collections[svc]:
                 collections[svc].append(iso)
 
-    # 5) Dedupe + sort
-    for k in collections:
-        collections[k] = sorted(set(collections[k]))
+    for k in collections.keys():
+        collections[k] = sorted(sorted(set(collections[k])))
 
     return collections
-
 
 # -----------------------------------
 # ICS writer
@@ -314,7 +296,6 @@ def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
 
 def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]]) -> str:
     cal = Calendar()
-    # Proper extra header line for ics>=0.7.x
     cal.extra.append(ContentLine(name="X-WR-CALNAME", value=f"Bin collections — {postcode} — {address_hint}"))
 
     titles = {
@@ -336,7 +317,6 @@ def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]
 
     return cal.serialize()
 
-
 # -----------------------------------
 # Main scrape + outputs
 # -----------------------------------
@@ -354,7 +334,6 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
         text_blob = await extract_text_content(form_frame)
 
         if not DATE_ANY_REGEX.search(text_blob):
-            # Helpful diagnostics if parsing appears blank
             preview = "\n".join(text_blob.splitlines()[:40])
             print(">>> WARNING: no DD/MM/YYYY detected in extracted text. Preview:")
             print(preview)
@@ -366,7 +345,6 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
     res = ScrapeResult(postcode=postcode, address_hint=address_hint, collections=collections)
     res.sort_dedupe()
     return res
-
 
 def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
     outdir.mkdir(parents=True, exist_ok=True)
@@ -392,7 +370,6 @@ def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
 
     return json_path, ics_path
 
-
 # -----------------------------------
 # Entrypoint
 # -----------------------------------
@@ -402,7 +379,6 @@ if __name__ == "__main__":
     HEADLESS = env_bool("HEADLESS", True)
     OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "public"))
 
-    # Inputs (support both manual inputs and defaults for scheduled runs)
     postcode = (
         os.getenv("POSTCODE")
         or os.getenv("POSTCODE_INPUT")
