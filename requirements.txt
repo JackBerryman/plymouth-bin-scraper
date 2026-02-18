@@ -4,3 +4,4 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
 requests>=2.32.0
 certifi>=2024.7.4
+rich>=13.0.0
