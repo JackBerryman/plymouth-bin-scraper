@@ -210,12 +210,21 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
         chosen = (await select.input_value()).strip()
     print(f">>> Selected address: {chosen}")
 
-    # Wait until Collection Details (or any date) appears
+    # Wait specifically for the main collection details section to fully render.
+    # Garden waste can appear first, so waiting for "any date" is too early.
+    await form_frame.get_by_text(re.compile(r"Collection Details", re.I)).wait_for(timeout=30000)
+
+    # Then wait for either brown or green bin heading to appear.
+    # This confirms the main results block has loaded, not just garden waste.
     try:
-        await form_frame.get_by_text(re.compile(r"Collection Details", re.I)).wait_for(timeout=30000)
+        await form_frame.get_by_text(
+            re.compile(r"Brown domestic bin|Green recycling bin", re.I)
+        ).wait_for(timeout=15000)
     except PWTimeout:
-        await form_frame.get_by_text(re.compile(r"\b\d{2}/\d{2}/\d{4}\b")).wait_for(timeout=30000)
-    print(">>> Dates detected in results.")
+        # fallback: give the page a bit more time if headings are slow
+        await form_frame.wait_for_timeout(5000)
+
+    print(">>> Main collection details detected.")
 
     return form_frame
 
@@ -227,12 +236,11 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
 async def extract_text_content(form_frame: Frame) -> str:
     """
     Extract visible text from the full form frame using innerText.
-    This preserves the visual line order much better than walking raw text nodes
-    or trying to guess a specific container.
+    Wait until the main collection details section is actually present.
     """
     content = ""
 
-    for _ in range(16):
+    for _ in range(20):
         content = await form_frame.evaluate(
             """
 () => (document.body && document.body.innerText) ? document.body.innerText : ""
@@ -240,7 +248,10 @@ async def extract_text_content(form_frame: Frame) -> str:
         )
         content = (content or "").replace("\r\n", "\n").strip()
 
-        if DATE_ANY_REGEX.search(content):
+        # Only return once the main collection section has appeared
+        if "Collection Details" in content and (
+            "Brown domestic bin" in content or "Green recycling bin" in content
+        ):
             return content
 
         await form_frame.wait_for_timeout(500)
