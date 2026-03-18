@@ -43,17 +43,14 @@ DEFAULT_FORM_URL = (
 
 UK_TZ = gettz("Europe/London")
 
-# Lines containing "today" (e.g., "Today's date: 24/10/2025") must NOT be treated as collections.
 RE_TODAY_LINE = re.compile(r"\btoday\b", re.IGNORECASE)
 
-# Flexible date patterns present on the page
 DATE_PATTERNS = (
     r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s*\d{2}/\d{2}/\d{4}\b",
     r"\b\d{2}/\d{2}/\d{4}\b",
 )
-DATE_ANY_REGEX = re.compile(DATE_PATTERNS[1])  # for quick presence checks
+DATE_ANY_REGEX = re.compile(DATE_PATTERNS[1])
 
-# Service section keywords (used to attribute dates)
 SERVICE_KEYWORDS = {
     "refuse": (
         "brown domestic bin",
@@ -93,7 +90,6 @@ def sanitize_filename(s: str) -> str:
 
 
 def ddmmyyyy_to_iso(text: str) -> Optional[str]:
-    """Extract first DD/MM/YYYY inside text and return as YYYY-MM-DD."""
     m = re.search(r"(\d{2}/\d{2}/\d{4})", text)
     if not m:
         return None
@@ -130,7 +126,6 @@ class ScrapeResult:
         for k, arr in self.collections.items():
             arr[:] = sorted(set(arr))
 
-
 # -----------------------------------
 # Playwright: drive the form
 # -----------------------------------
@@ -139,7 +134,6 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     await page.goto(form_url, wait_until="domcontentloaded")
     print(f">>> Page URL: {page.url}")
 
-    # Find the embedded form iframe
     frames = page.frames
     print(">>> Frames discovered:")
     for fr in frames:
@@ -147,7 +141,6 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
 
     form_frame = next((fr for fr in frames if "/fillform/" in fr.url), None)
 
-    # If not already present, wait for iframe element and get its content frame
     if not form_frame:
         await page.wait_for_selector("iframe[src*='fillform']", timeout=30000)
         iframe_el = await page.query_selector("iframe[src*='fillform']")
@@ -159,7 +152,6 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
 
     print(f">>> Using frame: {getattr(form_frame, 'url', '[frame]')}")
 
-    # Locate postcode/street textbox
     textbox = None
     try:
         textbox = form_frame.get_by_role("textbox", name=re.compile("post.*code|street", re.I))
@@ -177,17 +169,14 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     await textbox.fill(postcode)
     print(f">>> Filled postcode: {postcode}")
 
-    # Click Find (or press Enter)
     try:
         await form_frame.get_by_role("button", name=re.compile("find", re.I)).click(timeout=10000)
     except Exception:
         await textbox.press("Enter")
 
-    # Wait for address dropdown
     select = form_frame.get_by_role("combobox").first
     await select.wait_for(state="visible", timeout=30000)
 
-    # Log a few options (best-effort)
     try:
         all_texts = await select.all_inner_texts()
         first = all_texts[0] if all_texts else ""
@@ -195,7 +184,6 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     except Exception:
         pass
 
-    # Pick best match, else first non-placeholder
     opt_xpath = (
         "//option[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
         f"'{address_hint.lower()}')]"
@@ -210,24 +198,19 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
         chosen = (await select.input_value()).strip()
     print(f">>> Selected address: {chosen}")
 
-    # Wait specifically for the main collection details section to fully render.
-    # Garden waste can appear first, so waiting for "any date" is too early.
     await form_frame.get_by_text(re.compile(r"Collection Details", re.I)).wait_for(timeout=30000)
 
-    # Then wait for either brown or green bin heading to appear.
-    # This confirms the main results block has loaded, not just garden waste.
-    try:
-        await form_frame.get_by_text(
-            re.compile(r"Brown domestic bin|Green recycling bin", re.I)
-        ).wait_for(timeout=15000)
-    except PWTimeout:
-        # fallback: give the page a bit more time if headings are slow
-        await form_frame.wait_for_timeout(5000)
+    # Wait until at least one of the main refuse/recycling headings appears.
+    # Use count checks to avoid Playwright strict mode violations.
+    for _ in range(30):
+        brown = await form_frame.get_by_role("heading", name=re.compile(r"Brown domestic bin", re.I)).count()
+        green = await form_frame.get_by_role("heading", name=re.compile(r"Green recycling bin", re.I)).count()
+        if brown > 0 or green > 0:
+            break
+        await form_frame.wait_for_timeout(500)
 
     print(">>> Main collection details detected.")
-
     return form_frame
-
 
 # -----------------------------------
 # Extract + parse text
@@ -248,7 +231,6 @@ async def extract_text_content(form_frame: Frame) -> str:
         )
         content = (content or "").replace("\r\n", "\n").strip()
 
-        # Only return once the main collection section has appeared
         if "Collection Details" in content and (
             "Brown domestic bin" in content or "Green recycling bin" in content
         ):
@@ -260,26 +242,21 @@ async def extract_text_content(form_frame: Frame) -> str:
 
 
 def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
-    # Keep empty lines out, but preserve order
     lines = [ln.strip() for ln in full_text.splitlines() if ln and ln.strip()]
     collections: Dict[str, List[str]] = {"refuse": [], "recycling": [], "garden": []}
     current_service: Optional[str] = None
     re_dates = [re.compile(p) for p in DATE_PATTERNS]
 
     for ln in lines:
-        # ignore "Today's date: ..."
         if RE_TODAY_LINE.search(ln):
             continue
 
-        # update service context if this line looks like a heading/label
         current_service = classify_service_from_text(ln, current_service)
 
-        # extract date strings from the line
         matches: List[str] = []
         for rx in re_dates:
             matches.extend(rx.findall(ln))
 
-        # if we don't currently know what service we're in, don't guess
         if not current_service:
             continue
 
@@ -294,7 +271,6 @@ def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
         collections[k] = sorted(set(collections[k]))
 
     return collections
-
 
 # -----------------------------------
 # ICS writer
@@ -322,7 +298,6 @@ def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]
             cal.events.add(ev)
 
     return cal.serialize()
-
 
 # -----------------------------------
 # Main scrape + outputs
@@ -379,7 +354,6 @@ def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
         f.write(build_ics(res.postcode, res.address_hint, res.collections))
 
     return json_path, ics_path
-
 
 # -----------------------------------
 # Entrypoint
