@@ -69,6 +69,7 @@ SERVICE_KEYWORDS = {
         "green bin",
     ),
     "garden": (
+        "garden waste collection",
         "garden waste bin",
         "garden waste",
         "garden",
@@ -86,8 +87,10 @@ def env_bool(name: str, default: bool = False) -> bool:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y"}
 
+
 def sanitize_filename(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", s)
+
 
 def ddmmyyyy_to_iso(text: str) -> Optional[str]:
     """Extract first DD/MM/YYYY inside text and return as YYYY-MM-DD."""
@@ -99,12 +102,14 @@ def ddmmyyyy_to_iso(text: str) -> Optional[str]:
     except ValueError:
         return None
 
+
 def classify_service_from_text(line: str, current: Optional[str]) -> Optional[str]:
     t = line.lower()
     for svc, keys in SERVICE_KEYWORDS.items():
         if any(k in t for k in keys):
             return svc
     return current
+
 
 @dataclass
 class ScrapeResult:
@@ -124,6 +129,7 @@ class ScrapeResult:
     def sort_dedupe(self):
         for k, arr in self.collections.items():
             arr[:] = sorted(set(arr))
+
 
 # -----------------------------------
 # Playwright: drive the form
@@ -213,30 +219,34 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
 
     return form_frame
 
+
 # -----------------------------------
 # Extract + parse text
 # -----------------------------------
 
 async def extract_text_content(form_frame: Frame) -> str:
     """
-    Extract visible text with preserved line breaks.
-    IMPORTANT: use innerText (not raw text nodes), otherwise headings + bullet lists
-    can collapse into the same 'line' and break service/date attribution.
+    Extract visible text from the full form frame using innerText.
+    This preserves the visual line order much better than walking raw text nodes
+    or trying to guess a specific container.
     """
     content = ""
 
-    # poll up to ~8s for dates to be present in innerText
     for _ in range(16):
         content = await form_frame.evaluate(
-            "() => (document.body && document.body.innerText) ? document.body.innerText : ''"
+            """
+() => (document.body && document.body.innerText) ? document.body.innerText : ""
+"""
         )
-        if content:
-            content = content.replace("\r\n", "\n").strip()
+        content = (content or "").replace("\r\n", "\n").strip()
+
         if DATE_ANY_REGEX.search(content):
             return content
+
         await form_frame.wait_for_timeout(500)
 
-    return (content or "").replace("\r\n", "\n").strip()
+    return content
+
 
 def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
     # Keep empty lines out, but preserve order
@@ -274,6 +284,7 @@ def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
 
     return collections
 
+
 # -----------------------------------
 # ICS writer
 # -----------------------------------
@@ -301,6 +312,7 @@ def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]
 
     return cal.serialize()
 
+
 # -----------------------------------
 # Main scrape + outputs
 # -----------------------------------
@@ -317,6 +329,9 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
         form_frame = await run_form(page, form_url, postcode, address_hint)
         text_blob = await extract_text_content(form_frame)
 
+        print(">>> Extracted text preview:")
+        print("\n".join(text_blob.splitlines()[:120]))
+
         if not DATE_ANY_REGEX.search(text_blob):
             preview = "\n".join(text_blob.splitlines()[:80])
             print(">>> WARNING: no DD/MM/YYYY detected in extracted text. Preview:")
@@ -328,6 +343,7 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
     res = ScrapeResult(postcode=postcode, address_hint=address_hint, collections=collections)
     res.sort_dedupe()
     return res
+
 
 def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
     outdir.mkdir(parents=True, exist_ok=True)
@@ -352,6 +368,7 @@ def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
         f.write(build_ics(res.postcode, res.address_hint, res.collections))
 
     return json_path, ics_path
+
 
 # -----------------------------------
 # Entrypoint
