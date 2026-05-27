@@ -126,13 +126,28 @@ class ScrapeResult:
         for k, arr in self.collections.items():
             arr[:] = sorted(set(arr))
 
+
 # -----------------------------------
 # Playwright: drive the form
 # -----------------------------------
 
 async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Frame:
-    await page.goto(form_url, wait_until="domcontentloaded")
-    print(f">>> Page URL: {page.url}")
+    # GitHub Actions runners are sometimes redirected to /forbidden.
+    # Retry a few times before failing clearly.
+    for attempt in range(1, 4):
+        await page.goto(form_url, wait_until="domcontentloaded")
+        print(f">>> Page URL attempt {attempt}: {page.url}")
+
+        if "/forbidden" not in page.url.lower():
+            break
+
+        print(">>> Hit /forbidden; retrying after 5 seconds...")
+        await page.wait_for_timeout(5000)
+    else:
+        raise RuntimeError(
+            "Plymouth/AchieveService returned /forbidden after 3 attempts. "
+            "GitHub Actions runner is likely being blocked."
+        )
 
     frames = page.frames
     print(">>> Frames discovered:")
@@ -196,21 +211,33 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     else:
         await select.select_option(index=1)
         chosen = (await select.input_value()).strip()
+
     print(f">>> Selected address: {chosen}")
 
+    # Wait for the main collection details area.
+    # Garden waste can load first, so don't treat any date as enough.
     await form_frame.get_by_text(re.compile(r"Collection Details", re.I)).wait_for(timeout=30000)
 
     # Wait until at least one of the main refuse/recycling headings appears.
     # Use count checks to avoid Playwright strict mode violations.
     for _ in range(30):
-        brown = await form_frame.get_by_role("heading", name=re.compile(r"Brown domestic bin", re.I)).count()
-        green = await form_frame.get_by_role("heading", name=re.compile(r"Green recycling bin", re.I)).count()
+        brown = await form_frame.get_by_role(
+            "heading",
+            name=re.compile(r"Brown domestic bin", re.I)
+        ).count()
+        green = await form_frame.get_by_role(
+            "heading",
+            name=re.compile(r"Green recycling bin", re.I)
+        ).count()
+
         if brown > 0 or green > 0:
             break
+
         await form_frame.wait_for_timeout(500)
 
     print(">>> Main collection details detected.")
     return form_frame
+
 
 # -----------------------------------
 # Extract + parse text
@@ -272,6 +299,7 @@ def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
 
     return collections
 
+
 # -----------------------------------
 # ICS writer
 # -----------------------------------
@@ -299,35 +327,36 @@ def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]
 
     return cal.serialize()
 
+
 # -----------------------------------
 # Main scrape + outputs
 # -----------------------------------
 
 async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool) -> "ScrapeResult":
     async with async_playwright() as pw:
-    browser = await pw.chromium.launch(
-    headless=headless,
-    args=[
-        "--disable-blink-features=AutomationControlled",
-        "--no-sandbox",
-    ],
-)
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
 
-context = await browser.new_context(
-    user_agent=(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    viewport={"width": 1366, "height": 768},
-    locale="en-GB",
-    timezone_id="Europe/London",
-    extra_http_headers={
-        "Accept-Language": "en-GB,en;q=0.9",
-    },
-)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 768},
+            locale="en-GB",
+            timezone_id="Europe/London",
+            extra_http_headers={
+                "Accept-Language": "en-GB,en;q=0.9",
+            },
+        )
 
-page = await context.new_page()
+        page = await context.new_page()
 
         if env_bool("DEBUG_PAUSE", False):
             await page.pause()
@@ -375,6 +404,7 @@ def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
 
     return json_path, ics_path
 
+
 # -----------------------------------
 # Entrypoint
 # -----------------------------------
@@ -402,6 +432,7 @@ if __name__ == "__main__":
     print(f">>> Postcode: {postcode} | Address hint: {address_hint}")
 
     result = asyncio.run(scrape(postcode, address_hint, FORM_URL, HEADLESS))
+
     print(json.dumps(
         {
             "postcode": result.postcode,
