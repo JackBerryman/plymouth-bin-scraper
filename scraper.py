@@ -3,17 +3,6 @@
 Scrapes Plymouth Council's "Waste - Check your bin day" (AchieveForms) with Playwright,
 parses visible results into per-service dates, filters out the "Today's date" line,
 and writes JSON + ICS to /public.
-
-ENV (optional)
---------------
-FORM_URL        - AchieveForms URL (defaults to Plymouth "Check your bin day")
-HEADLESS        - "true"/"false" (default true)
-DEBUG_PAUSE     - "true" to open Playwright Inspector before interacting (default false)
-OUTPUT_DIR      - output folder (default "public")
-
-POSTCODE / ADDRESS_HINT                            (preferred)
-POSTCODE_INPUT / ADDRESS_HINT_INPUT                (manual workflow inputs)
-POSTCODE_DEFAULT / ADDRESS_HINT_DEFAULT            (scheduled workflow defaults)
 """
 
 import asyncio
@@ -28,14 +17,13 @@ from typing import Dict, List, Optional, Tuple
 from dateutil.tz import gettz
 from ics import Calendar, Event
 from ics.grammar.parse import ContentLine
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Frame
+from playwright.async_api import async_playwright, Frame
 
 
 # -----------------------------------
 # Config
 # -----------------------------------
 
-# New/live Plymouth AchieveForms URL
 DEFAULT_FORM_URL = (
     "https://plymouth-self.achieveservice.com/AchieveForms/"
     "?mode=fill&consentMessage=yes"
@@ -142,34 +130,78 @@ class ScrapeResult:
 
 async def find_form_frame(page) -> Frame:
     """
-    AchieveForms sometimes renders directly in the main frame and sometimes inside
-    an iframe/about:blank frame. Find the frame that actually contains the input.
+    Find the frame that actually contains a visible postcode/street input.
+    AchieveForms may render directly in the main frame or inside an about:blank iframe.
     """
-    # First, try obvious iframe patterns.
-    for selector in ("iframe[src*='fillform']", "iframe"):
-        try:
-            iframe_el = await page.query_selector(selector)
-            if iframe_el:
-                fr = await iframe_el.content_frame()
-                if fr:
+    print(">>> Searching frames for visible postcode/street input...")
+
+    for attempt in range(1, 41):  # approx 20 seconds
+        for fr in page.frames:
+            try:
+                textbox = fr.get_by_role(
+                    "textbox",
+                    name=re.compile(r"post.*code|street|postcode", re.I),
+                ).first
+
+                try:
+                    await textbox.wait_for(state="visible", timeout=300)
+                    print(f">>> Found visible postcode/street textbox in frame: {fr.url}")
+                    return fr
+                except Exception:
+                    pass
+
+                inputs = fr.locator("input[type='text']")
+                count = await inputs.count()
+
+                for i in range(count):
+                    inp = inputs.nth(i)
                     try:
-                        if await fr.locator("input[type='text']").count() > 0:
-                            return fr
+                        await inp.wait_for(state="visible", timeout=300)
+                        print(f">>> Found visible text input in frame: {fr.url}")
+                        return fr
                     except Exception:
-                        pass
-        except Exception:
-            pass
+                        continue
 
-    # Then search all frames for a text input.
-    for fr in page.frames:
+            except Exception:
+                continue
+
+        if attempt in (1, 10, 20, 30, 40):
+            print(f">>> Still looking for visible input... attempt {attempt}/40")
+            print(">>> Current frames:")
+            for fr in page.frames:
+                print(f"   - {fr.url}")
+
+        await page.wait_for_timeout(500)
+
+    raise RuntimeError("Could not find a visible postcode/street input in any frame.")
+
+
+async def find_visible_textbox(form_frame: Frame):
+    """
+    Return the visible postcode/street textbox from the selected frame.
+    """
+    try:
+        textbox = form_frame.get_by_role(
+            "textbox",
+            name=re.compile(r"post.*code|street|postcode", re.I),
+        ).first
+        await textbox.wait_for(state="visible", timeout=5000)
+        return textbox
+    except Exception:
+        pass
+
+    inputs = form_frame.locator("input[type='text']")
+    count = await inputs.count()
+
+    for i in range(count):
+        inp = inputs.nth(i)
         try:
-            if await fr.locator("input[type='text']").count() > 0:
-                return fr
+            await inp.wait_for(state="visible", timeout=1000)
+            return inp
         except Exception:
-            pass
+            continue
 
-    # Fall back to main frame.
-    return page.main_frame
+    raise RuntimeError("Could not find the postcode input.")
 
 
 async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Frame:
@@ -189,40 +221,23 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
             "This means the runner/browser is being blocked before the form loads."
         )
 
-    frames = page.frames
     print(">>> Frames discovered:")
-    for fr in frames:
+    for fr in page.frames:
         print(f"   - {fr.url}")
 
     form_frame = await find_form_frame(page)
-
     print(f">>> Using frame: {getattr(form_frame, 'url', '[frame]')}")
 
-    # Locate postcode/street textbox.
-    textbox = None
-    try:
-        textbox = form_frame.get_by_role("textbox", name=re.compile("post.*code|street", re.I))
-        await textbox.wait_for(state="visible", timeout=15000)
-    except Exception:
-        textbox = None
-
-    if textbox is None:
-        try:
-            textbox = form_frame.locator("input[type='text']").first
-            await textbox.wait_for(state="visible", timeout=15000)
-        except Exception as e:
-            raise RuntimeError("Could not find the postcode input.") from e
+    textbox = await find_visible_textbox(form_frame)
 
     await textbox.fill(postcode)
     print(f">>> Filled postcode: {postcode}")
 
-    # Click Find, or press Enter if the button lookup fails.
     try:
         await form_frame.get_by_role("button", name=re.compile("find|search", re.I)).click(timeout=10000)
     except Exception:
         await textbox.press("Enter")
 
-    # Wait for address dropdown.
     select = form_frame.get_by_role("combobox").first
     await select.wait_for(state="visible", timeout=30000)
 
@@ -233,7 +248,6 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     except Exception:
         pass
 
-    # Pick best match, else first non-placeholder.
     opt_xpath = (
         "//option[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
         f"'{address_hint.lower()}')]"
@@ -250,7 +264,6 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
 
     print(f">>> Selected address: {chosen}")
 
-    # Wait for main collection details.
     await form_frame.get_by_text(re.compile(r"Collection Details", re.I)).wait_for(timeout=30000)
 
     # Garden waste can load separately; wait for refuse/recycling headings too.
