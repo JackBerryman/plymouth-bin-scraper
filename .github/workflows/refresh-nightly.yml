@@ -7,6 +7,10 @@ on:
   # Handy for manual checks
   workflow_dispatch:
 
+# Force GitHub JavaScript actions to run on Node.js 24
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 # Avoid clashing page deployments if two workflows overlap
 concurrency:
   group: pages
@@ -58,6 +62,7 @@ jobs:
       pages: write
       id-token: write
     runs-on: ubuntu-latest
+
     steps:
       - name: Deploy to GitHub Pages
         uses: actions/deploy-pages@v4
