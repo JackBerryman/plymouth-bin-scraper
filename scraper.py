@@ -35,10 +35,13 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Fr
 # -----------------------------------
 
 DEFAULT_FORM_URL = (
-    "https://plymouth-self.achieveservice.com/en/AchieveForms/"
-    "?form_uri=sandbox-publish://AF-Process-31283f9a-3ae7-4225-af71-bf3884e0ac1b/"
-    "AF-Stagedba4a7d5-e916-46b6-abdb-643d38bec875/definition.json"
-    "&redirectlink=%2Fen&cancelRedirectLink=%2Fen&consentMessage=yes"
+    "https://plymouth-self.achieveservice.com/AchieveForms/"
+    "?mode=fill&consentMessage=yes"
+    "&form_uri=sandbox-publish://AF-Process-084d6742-3572-41ba-ac1a-430750451f9d/"
+    "AF-Stage-67ba684d-0a5b-48f8-9c50-1c01cc43c396/definition.json"
+    "&process=1"
+    "&process_uri=sandbox-processes://AF-Process-084d6742-3572-41ba-ac1a-430750451f9d"
+    "&process_id=AF-Process-084d6742-3572-41ba-ac1a-430750451f9d"
 )
 
 UK_TZ = gettz("Europe/London")
@@ -154,16 +157,23 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     for fr in frames:
         print(f"   - {fr.url}")
 
-    form_frame = next((fr for fr in frames if "/fillform/" in fr.url), None)
+form_frame = next((fr for fr in frames if "/fillform/" in fr.url or "AchieveForms" in fr.url), None)
 
-    if not form_frame:
-        await page.wait_for_selector("iframe[src*='fillform']", timeout=30000)
+if not form_frame:
+    try:
+        await page.wait_for_selector("iframe[src*='fillform']", timeout=10000)
         iframe_el = await page.query_selector("iframe[src*='fillform']")
-        if not iframe_el:
-            raise RuntimeError("AchieveForms iframe element not found.")
-        form_frame = await iframe_el.content_frame()
-        if not form_frame:
-            raise RuntimeError("Iframe found, but content frame isn't available yet.")
+        if iframe_el:
+            form_frame = await iframe_el.content_frame()
+    except Exception:
+        pass
+
+# Newer AchieveForms link may render the form directly in the main page, not an iframe.
+if not form_frame:
+    form_frame = page.main_frame
+
+if not form_frame:
+    raise RuntimeError("Could not find AchieveForms frame or main form page.")
 
     print(f">>> Using frame: {getattr(form_frame, 'url', '[frame]')}")
 
