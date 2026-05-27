@@ -30,10 +30,12 @@ from ics import Calendar, Event
 from ics.grammar.parse import ContentLine
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Frame
 
+
 # -----------------------------------
 # Config
 # -----------------------------------
 
+# New/live Plymouth AchieveForms URL
 DEFAULT_FORM_URL = (
     "https://plymouth-self.achieveservice.com/AchieveForms/"
     "?mode=fill&consentMessage=yes"
@@ -52,6 +54,7 @@ DATE_PATTERNS = (
     r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s*\d{2}/\d{2}/\d{4}\b",
     r"\b\d{2}/\d{2}/\d{4}\b",
 )
+
 DATE_ANY_REGEX = re.compile(DATE_PATTERNS[1])
 
 SERVICE_KEYWORDS = {
@@ -76,6 +79,7 @@ SERVICE_KEYWORDS = {
         "green garden bin",
     ),
 }
+
 
 # -----------------------------------
 # Helpers
@@ -115,7 +119,9 @@ class ScrapeResult:
     postcode: str
     address_hint: str
     collections: Dict[str, List[str]] = field(default_factory=lambda: {
-        "refuse": [], "recycling": [], "garden": []
+        "refuse": [],
+        "recycling": [],
+        "garden": [],
     })
     scraped_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -134,9 +140,40 @@ class ScrapeResult:
 # Playwright: drive the form
 # -----------------------------------
 
+async def find_form_frame(page) -> Frame:
+    """
+    AchieveForms sometimes renders directly in the main frame and sometimes inside
+    an iframe/about:blank frame. Find the frame that actually contains the input.
+    """
+    # First, try obvious iframe patterns.
+    for selector in ("iframe[src*='fillform']", "iframe"):
+        try:
+            iframe_el = await page.query_selector(selector)
+            if iframe_el:
+                fr = await iframe_el.content_frame()
+                if fr:
+                    try:
+                        if await fr.locator("input[type='text']").count() > 0:
+                            return fr
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # Then search all frames for a text input.
+    for fr in page.frames:
+        try:
+            if await fr.locator("input[type='text']").count() > 0:
+                return fr
+        except Exception:
+            pass
+
+    # Fall back to main frame.
+    return page.main_frame
+
+
 async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Frame:
-    # GitHub Actions runners are sometimes redirected to /forbidden.
-    # Retry a few times before failing clearly.
+    # Retry because AchieveService can intermittently return /forbidden.
     for attempt in range(1, 4):
         await page.goto(form_url, wait_until="domcontentloaded")
         print(f">>> Page URL attempt {attempt}: {page.url}")
@@ -149,7 +186,7 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     else:
         raise RuntimeError(
             "Plymouth/AchieveService returned /forbidden after 3 attempts. "
-            "GitHub Actions runner is likely being blocked."
+            "This means the runner/browser is being blocked before the form loads."
         )
 
     frames = page.frames
@@ -157,34 +194,19 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
     for fr in frames:
         print(f"   - {fr.url}")
 
-form_frame = next((fr for fr in frames if "/fillform/" in fr.url or "AchieveForms" in fr.url), None)
-
-if not form_frame:
-    try:
-        await page.wait_for_selector("iframe[src*='fillform']", timeout=10000)
-        iframe_el = await page.query_selector("iframe[src*='fillform']")
-        if iframe_el:
-            form_frame = await iframe_el.content_frame()
-    except Exception:
-        pass
-
-# Newer AchieveForms link may render the form directly in the main page, not an iframe.
-if not form_frame:
-    form_frame = page.main_frame
-
-if not form_frame:
-    raise RuntimeError("Could not find AchieveForms frame or main form page.")
+    form_frame = await find_form_frame(page)
 
     print(f">>> Using frame: {getattr(form_frame, 'url', '[frame]')}")
 
+    # Locate postcode/street textbox.
     textbox = None
     try:
         textbox = form_frame.get_by_role("textbox", name=re.compile("post.*code|street", re.I))
         await textbox.wait_for(state="visible", timeout=15000)
     except Exception:
-        pass
+        textbox = None
 
-    if not textbox:
+    if textbox is None:
         try:
             textbox = form_frame.locator("input[type='text']").first
             await textbox.wait_for(state="visible", timeout=15000)
@@ -194,11 +216,13 @@ if not form_frame:
     await textbox.fill(postcode)
     print(f">>> Filled postcode: {postcode}")
 
+    # Click Find, or press Enter if the button lookup fails.
     try:
-        await form_frame.get_by_role("button", name=re.compile("find", re.I)).click(timeout=10000)
+        await form_frame.get_by_role("button", name=re.compile("find|search", re.I)).click(timeout=10000)
     except Exception:
         await textbox.press("Enter")
 
+    # Wait for address dropdown.
     select = form_frame.get_by_role("combobox").first
     await select.wait_for(state="visible", timeout=30000)
 
@@ -209,11 +233,13 @@ if not form_frame:
     except Exception:
         pass
 
+    # Pick best match, else first non-placeholder.
     opt_xpath = (
         "//option[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
         f"'{address_hint.lower()}')]"
     )
     options = form_frame.locator(opt_xpath)
+
     if await options.count():
         value = await options.first.get_attribute("value")
         await select.select_option(value=value)
@@ -224,20 +250,18 @@ if not form_frame:
 
     print(f">>> Selected address: {chosen}")
 
-    # Wait for the main collection details area.
-    # Garden waste can load first, so don't treat any date as enough.
+    # Wait for main collection details.
     await form_frame.get_by_text(re.compile(r"Collection Details", re.I)).wait_for(timeout=30000)
 
-    # Wait until at least one of the main refuse/recycling headings appears.
-    # Use count checks to avoid Playwright strict mode violations.
+    # Garden waste can load separately; wait for refuse/recycling headings too.
     for _ in range(30):
         brown = await form_frame.get_by_role(
             "heading",
-            name=re.compile(r"Brown domestic bin", re.I)
+            name=re.compile(r"Brown domestic bin", re.I),
         ).count()
         green = await form_frame.get_by_role(
             "heading",
-            name=re.compile(r"Green recycling bin", re.I)
+            name=re.compile(r"Green recycling bin", re.I),
         ).count()
 
         if brown > 0 or green > 0:
@@ -280,7 +304,11 @@ async def extract_text_content(form_frame: Frame) -> str:
 
 def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
     lines = [ln.strip() for ln in full_text.splitlines() if ln and ln.strip()]
-    collections: Dict[str, List[str]] = {"refuse": [], "recycling": [], "garden": []}
+    collections: Dict[str, List[str]] = {
+        "refuse": [],
+        "recycling": [],
+        "garden": [],
+    }
     current_service: Optional[str] = None
     re_dates = [re.compile(p) for p in DATE_PATTERNS]
 
@@ -304,7 +332,7 @@ def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
             if iso not in collections[current_service]:
                 collections[current_service].append(iso)
 
-    for k in collections.keys():
+    for k in collections:
         collections[k] = sorted(set(collections[k]))
 
     return collections
@@ -392,6 +420,7 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
 
 def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
     outdir.mkdir(parents=True, exist_ok=True)
+
     base = f"{sanitize_filename(res.postcode.replace(' ', '_'))}_{sanitize_filename(res.address_hint.replace(' ', '_'))}"
     json_path = outdir / f"{base}.json"
     ics_path = outdir / f"{base}.ics"
