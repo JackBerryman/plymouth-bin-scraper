@@ -35,7 +35,6 @@ jobs:
 
       - name: Run scraper (headless)
         env:
-          FORM_URL: https://plymouth-self.achieveservice.com/en/AchieveForms/?form_uri=sandbox-publish://AF-Process-31283f9a-3ae7-4225-af71-bf3884e0ac1b/AF-Stagedba4a7d5-e916-46b6-abdb-643d38bec875/definition.json&redirectlink=%2Fen&cancelRedirectLink=%2Fen&consentMessage=yes
           HEADLESS: "true"
           DEBUG_PAUSE: "false"
           OUTPUT_DIR: public
