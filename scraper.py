@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Scrapes Plymouth Council's "Waste - Check your bin day" (AchieveForms) with Playwright,
+Scrapes Plymouth Council's "Waste - Check your bin day" AchieveForms form,
 parses visible results into per-service dates, filters out the "Today's date" line,
 and writes JSON + ICS to /public.
 """
@@ -63,8 +63,8 @@ SERVICE_KEYWORDS = {
         "garden waste collection",
         "garden waste bin",
         "garden waste",
-        "garden",
         "green garden bin",
+        "garden",
     ),
 }
 
@@ -88,6 +88,7 @@ def ddmmyyyy_to_iso(text: str) -> Optional[str]:
     m = re.search(r"(\d{2}/\d{2}/\d{4})", text)
     if not m:
         return None
+
     try:
         return datetime.strptime(m.group(1), "%d/%m/%Y").date().isoformat()
     except ValueError:
@@ -96,9 +97,11 @@ def ddmmyyyy_to_iso(text: str) -> Optional[str]:
 
 def classify_service_from_text(line: str, current: Optional[str]) -> Optional[str]:
     t = line.lower()
+
     for svc, keys in SERVICE_KEYWORDS.items():
         if any(k in t for k in keys):
             return svc
+
     return current
 
 
@@ -116,6 +119,7 @@ class ScrapeResult:
     def add(self, service: str, iso_date: str):
         if service not in self.collections:
             self.collections[service] = []
+
         if iso_date not in self.collections[service]:
             self.collections[service].append(iso_date)
 
@@ -282,6 +286,9 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
 
         await form_frame.wait_for_timeout(500)
 
+    # Belt and braces: AchieveForms can render the garden waste section shortly after refuse/recycling.
+    await form_frame.wait_for_timeout(3000)
+
     print(">>> Main collection details detected.")
     return form_frame
 
@@ -293,11 +300,14 @@ async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Fra
 async def extract_text_content(form_frame: Frame) -> str:
     """
     Extract visible text from the full form frame using innerText.
-    Wait until the main collection details section is actually present.
+    Wait until the main collection details section is present, then wait for the
+    visible text to stabilise so later-loaded garden waste data is not missed.
     """
-    content = ""
+    last_content = ""
+    stable_count = 0
+    best_content = ""
 
-    for _ in range(20):
+    for _ in range(30):  # approx 15 seconds
         content = await form_frame.evaluate(
             """
 () => (document.body && document.body.innerText) ? document.body.innerText : ""
@@ -305,14 +315,30 @@ async def extract_text_content(form_frame: Frame) -> str:
         )
         content = (content or "").replace("\r\n", "\n").strip()
 
-        if "Collection Details" in content and (
-            "Brown domestic bin" in content or "Green recycling bin" in content
-        ):
-            return content
+        has_main_collection = (
+            "Collection Details" in content
+            and (
+                "Brown domestic bin" in content
+                or "Green recycling bin" in content
+            )
+        )
 
+        if has_main_collection:
+            best_content = content
+
+            # Wait until the content stops changing. This catches garden waste if it loads slightly later.
+            if content == last_content:
+                stable_count += 1
+            else:
+                stable_count = 0
+
+            if stable_count >= 3:
+                return content
+
+        last_content = content
         await form_frame.wait_for_timeout(500)
 
-    return content
+    return best_content or last_content
 
 
 def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
@@ -342,6 +368,7 @@ def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
             iso = ddmmyyyy_to_iso(raw)
             if not iso:
                 continue
+
             if iso not in collections[current_service]:
                 collections[current_service].append(iso)
 
@@ -367,6 +394,7 @@ def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]
 
     for service, dates in collections.items():
         title = titles.get(service, service.title())
+
         for iso in dates:
             d = datetime.strptime(iso, "%Y-%m-%d").date()
             ev = Event()
@@ -416,7 +444,7 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
         text_blob = await extract_text_content(form_frame)
 
         print(">>> Extracted text preview:")
-        print("\n".join(text_blob.splitlines()[:120]))
+        print("\n".join(text_blob.splitlines()[:160]))
 
         if not DATE_ANY_REGEX.search(text_blob):
             preview = "\n".join(text_blob.splitlines()[:80])
