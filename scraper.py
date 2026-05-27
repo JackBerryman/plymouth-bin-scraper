@@ -305,9 +305,29 @@ def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]
 
 async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool) -> "ScrapeResult":
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless)
-        context = await browser.new_context()
-        page = await context.new_page()
+    browser = await pw.chromium.launch(
+    headless=headless,
+    args=[
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+    ],
+)
+
+context = await browser.new_context(
+    user_agent=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    viewport={"width": 1366, "height": 768},
+    locale="en-GB",
+    timezone_id="Europe/London",
+    extra_http_headers={
+        "Accept-Language": "en-GB,en;q=0.9",
+    },
+)
+
+page = await context.new_page()
 
         if env_bool("DEBUG_PAUSE", False):
             await page.pause()
