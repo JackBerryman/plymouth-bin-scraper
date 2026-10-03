@@ -2,6 +2,7 @@
 """
 Scrapes Plymouth Council's "Waste - Check your bin day" AchieveForms form,
 parses visible results into per-service dates, filters out the "Today's date" line,
+ignores food waste so it cannot contaminate recycling dates,
 and writes JSON + ICS to /public.
 """
 
@@ -66,6 +67,13 @@ SERVICE_KEYWORDS = {
         "green garden bin",
         "garden",
     ),
+    # Recognise food waste so its date does not get incorrectly
+    # attributed to the previous section, usually recycling.
+    # We deliberately do not publish food waste yet.
+    "food": (
+        "food waste bin",
+        "food waste",
+    ),
 }
 
 
@@ -86,16 +94,24 @@ def sanitize_filename(s: str) -> str:
 
 def ddmmyyyy_to_iso(text: str) -> Optional[str]:
     m = re.search(r"(\d{2}/\d{2}/\d{4})", text)
+
     if not m:
         return None
 
     try:
-        return datetime.strptime(m.group(1), "%d/%m/%Y").date().isoformat()
+        return datetime.strptime(
+            m.group(1),
+            "%d/%m/%Y"
+        ).date().isoformat()
     except ValueError:
         return None
 
 
-def classify_service_from_text(line: str, current: Optional[str]) -> Optional[str]:
+def classify_service_from_text(
+    line: str,
+    current: Optional[str]
+) -> Optional[str]:
+
     t = line.lower()
 
     for svc, keys in SERVICE_KEYWORDS.items():
@@ -109,12 +125,18 @@ def classify_service_from_text(line: str, current: Optional[str]) -> Optional[st
 class ScrapeResult:
     postcode: str
     address_hint: str
-    collections: Dict[str, List[str]] = field(default_factory=lambda: {
-        "refuse": [],
-        "recycling": [],
-        "garden": [],
-    })
-    scraped_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    collections: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            "refuse": [],
+            "recycling": [],
+            "garden": [],
+        }
+    )
+    scraped_at: str = field(
+        default_factory=lambda: datetime.now(
+            timezone.utc
+        ).isoformat()
+    )
 
     def add(self, service: str, iso_date: str):
         if service not in self.collections:
@@ -129,28 +151,43 @@ class ScrapeResult:
 
 
 # -----------------------------------
-# Playwright: drive the form
+# Playwright: find form frame
 # -----------------------------------
 
 async def find_form_frame(page) -> Frame:
     """
     Find the frame that actually contains a visible postcode/street input.
-    AchieveForms may render directly in the main frame or inside an about:blank iframe.
+
+    AchieveForms may render directly in the main frame or inside an
+    about:blank iframe.
     """
+
     print(">>> Searching frames for visible postcode/street input...")
 
-    for attempt in range(1, 41):  # approx 20 seconds
+    for attempt in range(1, 41):
         for fr in page.frames:
             try:
                 textbox = fr.get_by_role(
                     "textbox",
-                    name=re.compile(r"post.*code|street|postcode", re.I),
+                    name=re.compile(
+                        r"post.*code|street|postcode",
+                        re.I
+                    ),
                 ).first
 
                 try:
-                    await textbox.wait_for(state="visible", timeout=300)
-                    print(f">>> Found visible postcode/street textbox in frame: {fr.url}")
+                    await textbox.wait_for(
+                        state="visible",
+                        timeout=300
+                    )
+
+                    print(
+                        ">>> Found visible postcode/street "
+                        f"textbox in frame: {fr.url}"
+                    )
+
                     return fr
+
                 except Exception:
                     pass
 
@@ -159,10 +196,20 @@ async def find_form_frame(page) -> Frame:
 
                 for i in range(count):
                     inp = inputs.nth(i)
+
                     try:
-                        await inp.wait_for(state="visible", timeout=300)
-                        print(f">>> Found visible text input in frame: {fr.url}")
+                        await inp.wait_for(
+                            state="visible",
+                            timeout=300
+                        )
+
+                        print(
+                            ">>> Found visible text input "
+                            f"in frame: {fr.url}"
+                        )
+
                         return fr
+
                     except Exception:
                         continue
 
@@ -170,27 +217,45 @@ async def find_form_frame(page) -> Frame:
                 continue
 
         if attempt in (1, 10, 20, 30, 40):
-            print(f">>> Still looking for visible input... attempt {attempt}/40")
+            print(
+                f">>> Still looking for visible input... "
+                f"attempt {attempt}/40"
+            )
+
             print(">>> Current frames:")
+
             for fr in page.frames:
                 print(f"   - {fr.url}")
 
         await page.wait_for_timeout(500)
 
-    raise RuntimeError("Could not find a visible postcode/street input in any frame.")
+    raise RuntimeError(
+        "Could not find a visible postcode/street input "
+        "in any frame."
+    )
 
 
 async def find_visible_textbox(form_frame: Frame):
     """
     Return the visible postcode/street textbox from the selected frame.
     """
+
     try:
         textbox = form_frame.get_by_role(
             "textbox",
-            name=re.compile(r"post.*code|street|postcode", re.I),
+            name=re.compile(
+                r"post.*code|street|postcode",
+                re.I
+            ),
         ).first
-        await textbox.wait_for(state="visible", timeout=5000)
+
+        await textbox.wait_for(
+            state="visible",
+            timeout=5000
+        )
+
         return textbox
+
     except Exception:
         pass
 
@@ -199,181 +264,342 @@ async def find_visible_textbox(form_frame: Frame):
 
     for i in range(count):
         inp = inputs.nth(i)
+
         try:
-            await inp.wait_for(state="visible", timeout=1000)
+            await inp.wait_for(
+                state="visible",
+                timeout=1000
+            )
+
             return inp
+
         except Exception:
             continue
 
-    raise RuntimeError("Could not find the postcode input.")
+    raise RuntimeError(
+        "Could not find the postcode input."
+    )
 
 
-async def run_form(page, form_url: str, postcode: str, address_hint: str) -> Frame:
+# -----------------------------------
+# Playwright: drive form
+# -----------------------------------
+
+async def run_form(
+    page,
+    form_url: str,
+    postcode: str,
+    address_hint: str
+) -> Frame:
+
     # Retry because AchieveService can intermittently return /forbidden.
     for attempt in range(1, 4):
-        await page.goto(form_url, wait_until="domcontentloaded")
-        print(f">>> Page URL attempt {attempt}: {page.url}")
+        await page.goto(
+            form_url,
+            wait_until="domcontentloaded"
+        )
+
+        print(
+            f">>> Page URL attempt {attempt}: "
+            f"{page.url}"
+        )
 
         if "/forbidden" not in page.url.lower():
             break
 
-        print(">>> Hit /forbidden; retrying after 5 seconds...")
+        print(
+            ">>> Hit /forbidden; retrying after 5 seconds..."
+        )
+
         await page.wait_for_timeout(5000)
+
     else:
         raise RuntimeError(
-            "Plymouth/AchieveService returned /forbidden after 3 attempts. "
-            "This means the runner/browser is being blocked before the form loads."
+            "Plymouth/AchieveService returned /forbidden "
+            "after 3 attempts."
         )
 
     print(">>> Frames discovered:")
+
     for fr in page.frames:
         print(f"   - {fr.url}")
 
     form_frame = await find_form_frame(page)
-    print(f">>> Using frame: {getattr(form_frame, 'url', '[frame]')}")
+
+    print(
+        f">>> Using frame: "
+        f"{getattr(form_frame, 'url', '[frame]')}"
+    )
 
     textbox = await find_visible_textbox(form_frame)
 
     await textbox.fill(postcode)
+
     print(f">>> Filled postcode: {postcode}")
 
     try:
-        await form_frame.get_by_role("button", name=re.compile("find|search", re.I)).click(timeout=10000)
+        await form_frame.get_by_role(
+            "button",
+            name=re.compile(
+                "find|search",
+                re.I
+            )
+        ).click(timeout=10000)
+
     except Exception:
         await textbox.press("Enter")
 
-    select = form_frame.get_by_role("combobox").first
-    await select.wait_for(state="visible", timeout=30000)
+    select = form_frame.get_by_role(
+        "combobox"
+    ).first
+
+    await select.wait_for(
+        state="visible",
+        timeout=30000
+    )
 
     try:
         all_texts = await select.all_inner_texts()
         first = all_texts[0] if all_texts else ""
-        print(f">>> Address options (first few): {first.splitlines()[:5]} ...")
+
+        print(
+            ">>> Address options (first few): "
+            f"{first.splitlines()[:5]} ..."
+        )
+
     except Exception:
         pass
 
     opt_xpath = (
-        "//option[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+        "//option[contains("
+        "translate(., "
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+        "'abcdefghijklmnopqrstuvwxyz'), "
         f"'{address_hint.lower()}')]"
     )
+
     options = form_frame.locator(opt_xpath)
 
     if await options.count():
-        value = await options.first.get_attribute("value")
-        await select.select_option(value=value)
-        chosen = (await options.first.inner_text()).strip()
+        value = await options.first.get_attribute(
+            "value"
+        )
+
+        await select.select_option(
+            value=value
+        )
+
+        chosen = (
+            await options.first.inner_text()
+        ).strip()
+
     else:
-        await select.select_option(index=1)
-        chosen = (await select.input_value()).strip()
+        await select.select_option(
+            index=1
+        )
 
-    print(f">>> Selected address: {chosen}")
+        chosen = (
+            await select.input_value()
+        ).strip()
 
-    await form_frame.get_by_text(re.compile(r"Collection Details", re.I)).wait_for(timeout=30000)
+    print(
+        f">>> Selected address: {chosen}"
+    )
 
-    # Garden waste can load separately; wait for refuse/recycling headings too.
+    await form_frame.get_by_text(
+        re.compile(
+            r"Collection Details",
+            re.I
+        )
+    ).wait_for(timeout=30000)
+
+    # Wait for the main refuse/recycling results.
     for _ in range(30):
+
         brown = await form_frame.get_by_role(
             "heading",
-            name=re.compile(r"Brown domestic bin", re.I),
+            name=re.compile(
+                r"Brown domestic bin",
+                re.I
+            ),
         ).count()
+
         green = await form_frame.get_by_role(
             "heading",
-            name=re.compile(r"Green recycling bin", re.I),
+            name=re.compile(
+                r"Green recycling bin",
+                re.I
+            ),
         ).count()
 
         if brown > 0 or green > 0:
             break
 
-        await form_frame.wait_for_timeout(500)
+        await form_frame.wait_for_timeout(
+            500
+        )
 
-    # Belt and braces: AchieveForms can render the garden waste section shortly after refuse/recycling.
-    await form_frame.wait_for_timeout(3000)
+    # AchieveForms may render garden/food waste slightly later.
+    await form_frame.wait_for_timeout(
+        3000
+    )
 
-    print(">>> Main collection details detected.")
+    print(
+        ">>> Main collection details detected."
+    )
+
     return form_frame
 
 
 # -----------------------------------
-# Extract + parse text
+# Extract text
 # -----------------------------------
 
-async def extract_text_content(form_frame: Frame) -> str:
+async def extract_text_content(
+    form_frame: Frame
+) -> str:
     """
-    Extract visible text from the full form frame using innerText.
-    Wait until the main collection details section is present, then wait for the
-    visible text to stabilise so later-loaded garden waste data is not missed.
+    Extract visible text from the full form frame.
+
+    Wait until the main collection details section exists,
+    then wait for the visible text to stabilise so later-loaded
+    garden waste and food waste sections are included.
     """
+
     last_content = ""
     stable_count = 0
     best_content = ""
 
-    for _ in range(30):  # approx 15 seconds
+    for _ in range(30):
+
         content = await form_frame.evaluate(
             """
-() => (document.body && document.body.innerText) ? document.body.innerText : ""
+() => (
+    document.body &&
+    document.body.innerText
+)
+    ? document.body.innerText
+    : ""
 """
         )
-        content = (content or "").replace("\r\n", "\n").strip()
+
+        content = (
+            content or ""
+        ).replace(
+            "\r\n",
+            "\n"
+        ).strip()
 
         has_main_collection = (
             "Collection Details" in content
             and (
                 "Brown domestic bin" in content
-                or "Green recycling bin" in content
+                or
+                "Green recycling bin" in content
             )
         )
 
         if has_main_collection:
             best_content = content
 
-            # Wait until the content stops changing. This catches garden waste if it loads slightly later.
             if content == last_content:
                 stable_count += 1
             else:
                 stable_count = 0
 
+            # Three unchanged reads means the page has settled.
             if stable_count >= 3:
                 return content
 
         last_content = content
-        await form_frame.wait_for_timeout(500)
+
+        await form_frame.wait_for_timeout(
+            500
+        )
 
     return best_content or last_content
 
 
-def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
-    lines = [ln.strip() for ln in full_text.splitlines() if ln and ln.strip()]
+# -----------------------------------
+# Parse collection dates
+# -----------------------------------
+
+def parse_collections_from_text(
+    full_text: str
+) -> Dict[str, List[str]]:
+
+    lines = [
+        ln.strip()
+        for ln in full_text.splitlines()
+        if ln and ln.strip()
+    ]
+
+    # These are the only services currently published
+    # to the JSON / widget.
     collections: Dict[str, List[str]] = {
         "refuse": [],
         "recycling": [],
         "garden": [],
     }
+
     current_service: Optional[str] = None
-    re_dates = [re.compile(p) for p in DATE_PATTERNS]
+
+    re_dates = [
+        re.compile(p)
+        for p in DATE_PATTERNS
+    ]
 
     for ln in lines:
+
+        # Ignore Today's date.
         if RE_TODAY_LINE.search(ln):
             continue
 
-        current_service = classify_service_from_text(ln, current_service)
+        # Update section context.
+        #
+        # This now recognises "food" as well.
+        # That prevents the food date from inheriting
+        # the previous "recycling" section.
+        current_service = (
+            classify_service_from_text(
+                ln,
+                current_service
+            )
+        )
 
         matches: List[str] = []
-        for rx in re_dates:
-            matches.extend(rx.findall(ln))
 
-        if not current_service:
+        for rx in re_dates:
+            matches.extend(
+                rx.findall(ln)
+            )
+
+        if not matches:
+            continue
+
+        # Only publish refuse, recycling and garden.
+        #
+        # current_service == "food" is deliberately
+        # ignored here.
+        if current_service not in collections:
             continue
 
         for raw in matches:
+
             iso = ddmmyyyy_to_iso(raw)
+
             if not iso:
                 continue
 
             if iso not in collections[current_service]:
-                collections[current_service].append(iso)
+                collections[current_service].append(
+                    iso
+                )
 
     for k in collections:
-        collections[k] = sorted(set(collections[k]))
+        collections[k] = sorted(
+            set(collections[k])
+        )
 
     return collections
 
@@ -382,9 +608,24 @@ def parse_collections_from_text(full_text: str) -> Dict[str, List[str]]:
 # ICS writer
 # -----------------------------------
 
-def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]]) -> str:
+def build_ics(
+    postcode: str,
+    address_hint: str,
+    collections: Dict[str, List[str]]
+) -> str:
+
     cal = Calendar()
-    cal.extra.append(ContentLine(name="X-WR-CALNAME", value=f"Bin collections — {postcode} — {address_hint}"))
+
+    cal.extra.append(
+        ContentLine(
+            name="X-WR-CALNAME",
+            value=(
+                f"Bin collections — "
+                f"{postcode} — "
+                f"{address_hint}"
+            )
+        )
+    )
 
     titles = {
         "refuse": "Refuse (brown bin)",
@@ -393,26 +634,49 @@ def build_ics(postcode: str, address_hint: str, collections: Dict[str, List[str]
     }
 
     for service, dates in collections.items():
-        title = titles.get(service, service.title())
+
+        title = titles.get(
+            service,
+            service.title()
+        )
 
         for iso in dates:
-            d = datetime.strptime(iso, "%Y-%m-%d").date()
+
+            d = datetime.strptime(
+                iso,
+                "%Y-%m-%d"
+            ).date()
+
             ev = Event()
+
             ev.name = title
             ev.begin = d
             ev.make_all_day()
-            ev.description = f"{title} — {postcode} — {address_hint}"
+
+            ev.description = (
+                f"{title} — "
+                f"{postcode} — "
+                f"{address_hint}"
+            )
+
             cal.events.add(ev)
 
     return cal.serialize()
 
 
 # -----------------------------------
-# Main scrape + outputs
+# Main scrape
 # -----------------------------------
 
-async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool) -> "ScrapeResult":
+async def scrape(
+    postcode: str,
+    address_hint: str,
+    form_url: str,
+    headless: bool
+) -> "ScrapeResult":
+
     async with async_playwright() as pw:
+
         browser = await pw.chromium.launch(
             headless=headless,
             args=[
@@ -423,11 +687,17 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
 
         context = await browser.new_context(
             user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/122.0.0.0 "
+                "Safari/537.36"
             ),
-            viewport={"width": 1366, "height": 768},
+            viewport={
+                "width": 1366,
+                "height": 768
+            },
             locale="en-GB",
             timezone_id="Europe/London",
             extra_http_headers={
@@ -437,36 +707,112 @@ async def scrape(postcode: str, address_hint: str, form_url: str, headless: bool
 
         page = await context.new_page()
 
-        if env_bool("DEBUG_PAUSE", False):
+        if env_bool(
+            "DEBUG_PAUSE",
+            False
+        ):
             await page.pause()
 
-        form_frame = await run_form(page, form_url, postcode, address_hint)
-        text_blob = await extract_text_content(form_frame)
+        form_frame = await run_form(
+            page,
+            form_url,
+            postcode,
+            address_hint
+        )
 
-        print(">>> Extracted text preview:")
-        print("\n".join(text_blob.splitlines()[:160]))
+        text_blob = await extract_text_content(
+            form_frame
+        )
 
-        if not DATE_ANY_REGEX.search(text_blob):
-            preview = "\n".join(text_blob.splitlines()[:80])
-            print(">>> WARNING: no DD/MM/YYYY detected in extracted text. Preview:")
+        print(
+            ">>> Extracted text preview:"
+        )
+
+        print(
+            "\n".join(
+                text_blob.splitlines()[:180]
+            )
+        )
+
+        if not DATE_ANY_REGEX.search(
+            text_blob
+        ):
+
+            preview = "\n".join(
+                text_blob.splitlines()[:80]
+            )
+
+            print(
+                ">>> WARNING: no DD/MM/YYYY "
+                "detected in extracted text."
+            )
+
             print(preview)
 
-        collections = parse_collections_from_text(text_blob)
+        collections = (
+            parse_collections_from_text(
+                text_blob
+            )
+        )
+
+        print(
+            ">>> Parsed collections:"
+        )
+
+        print(
+            json.dumps(
+                collections,
+                indent=2
+            )
+        )
+
         await browser.close()
 
-    res = ScrapeResult(postcode=postcode, address_hint=address_hint, collections=collections)
+    res = ScrapeResult(
+        postcode=postcode,
+        address_hint=address_hint,
+        collections=collections
+    )
+
     res.sort_dedupe()
+
     return res
 
 
-def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
-    outdir.mkdir(parents=True, exist_ok=True)
+# -----------------------------------
+# Write outputs
+# -----------------------------------
 
-    base = f"{sanitize_filename(res.postcode.replace(' ', '_'))}_{sanitize_filename(res.address_hint.replace(' ', '_'))}"
-    json_path = outdir / f"{base}.json"
-    ics_path = outdir / f"{base}.ics"
+def write_outputs(
+    res: ScrapeResult,
+    outdir: Path
+) -> Tuple[Path, Path]:
 
-    with json_path.open("w", encoding="utf-8") as f:
+    outdir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    base = (
+        f"{sanitize_filename(res.postcode.replace(' ', '_'))}_"
+        f"{sanitize_filename(res.address_hint.replace(' ', '_'))}"
+    )
+
+    json_path = (
+        outdir /
+        f"{base}.json"
+    )
+
+    ics_path = (
+        outdir /
+        f"{base}.ics"
+    )
+
+    with json_path.open(
+        "w",
+        encoding="utf-8"
+    ) as f:
+
         json.dump(
             {
                 "postcode": res.postcode,
@@ -479,8 +825,18 @@ def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
             ensure_ascii=False,
         )
 
-    with ics_path.open("w", encoding="utf-8") as f:
-        f.write(build_ics(res.postcode, res.address_hint, res.collections))
+    with ics_path.open(
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        f.write(
+            build_ics(
+                res.postcode,
+                res.address_hint,
+                res.collections
+            )
+        )
 
     return json_path, ics_path
 
@@ -490,39 +846,91 @@ def write_outputs(res: ScrapeResult, outdir: Path) -> Tuple[Path, Path]:
 # -----------------------------------
 
 if __name__ == "__main__":
-    FORM_URL = os.getenv("FORM_URL", DEFAULT_FORM_URL)
-    HEADLESS = env_bool("HEADLESS", True)
-    OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "public"))
+
+    FORM_URL = os.getenv(
+        "FORM_URL",
+        DEFAULT_FORM_URL
+    )
+
+    HEADLESS = env_bool(
+        "HEADLESS",
+        True
+    )
+
+    OUTPUT_DIR = Path(
+        os.getenv(
+            "OUTPUT_DIR",
+            "public"
+        )
+    )
 
     postcode = (
         os.getenv("POSTCODE")
-        or os.getenv("POSTCODE_INPUT")
-        or os.getenv("POSTCODE_DEFAULT")
-        or "PL6 5HX"
+        or
+        os.getenv("POSTCODE_INPUT")
+        or
+        os.getenv("POSTCODE_DEFAULT")
+        or
+        "PL6 5HX"
     )
+
     address_hint = (
         os.getenv("ADDRESS_HINT")
-        or os.getenv("ADDRESS_HINT_INPUT")
-        or os.getenv("ADDRESS_HINT_DEFAULT")
-        or "72 Windermere"
+        or
+        os.getenv("ADDRESS_HINT_INPUT")
+        or
+        os.getenv("ADDRESS_HINT_DEFAULT")
+        or
+        "72 Windermere"
     )
 
-    print(f">>> Using FORM_URL: {FORM_URL}")
-    print(f">>> Headless: {HEADLESS}")
-    print(f">>> Postcode: {postcode} | Address hint: {address_hint}")
+    print(
+        f">>> Using FORM_URL: "
+        f"{FORM_URL}"
+    )
 
-    result = asyncio.run(scrape(postcode, address_hint, FORM_URL, HEADLESS))
+    print(
+        f">>> Headless: "
+        f"{HEADLESS}"
+    )
 
-    print(json.dumps(
-        {
-            "postcode": result.postcode,
-            "address_hint": result.address_hint,
-            "collections": result.collections,
-            "scraped_at": result.scraped_at,
-        },
-        indent=2,
-    ))
+    print(
+        f">>> Postcode: "
+        f"{postcode} | "
+        f"Address hint: "
+        f"{address_hint}"
+    )
 
-    jp, ip = write_outputs(result, OUTPUT_DIR)
-    print(f">>> Wrote: {jp}")
-    print(f">>> Wrote: {ip}")
+    result = asyncio.run(
+        scrape(
+            postcode,
+            address_hint,
+            FORM_URL,
+            HEADLESS
+        )
+    )
+
+    print(
+        json.dumps(
+            {
+                "postcode": result.postcode,
+                "address_hint": result.address_hint,
+                "collections": result.collections,
+                "scraped_at": result.scraped_at,
+            },
+            indent=2,
+        )
+    )
+
+    jp, ip = write_outputs(
+        result,
+        OUTPUT_DIR
+    )
+
+    print(
+        f">>> Wrote: {jp}"
+    )
+
+    print(
+        f">>> Wrote: {ip}"
+    )
