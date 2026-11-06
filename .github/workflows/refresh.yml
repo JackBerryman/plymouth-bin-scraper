@@ -1,26 +1,21 @@
 name: Nightly bin data refresh (no WhatsApp)
 
 on:
-  # Runs every night at 02:15 UTC
   schedule:
     - cron: "15 2 * * *"
 
-  # Handy for manual checks
   workflow_dispatch:
 
-# Force GitHub JavaScript actions to run on Node.js 24
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Avoid clashing page deployments if two workflows overlap
 concurrency:
   group: pages
   cancel-in-progress: false
 
 jobs:
   refresh:
-    # Pin to Ubuntu 24.04 because Playwright 1.55.0 does not support Ubuntu 26.04
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
@@ -43,8 +38,6 @@ jobs:
           HEADLESS: "true"
           DEBUG_PAUSE: "false"
           OUTPUT_DIR: public
-
-          # Defaults for unattended runs
           POSTCODE_DEFAULT: "PL6 5HX"
           ADDRESS_HINT_DEFAULT: "72 Windermere"
 
@@ -60,10 +53,12 @@ jobs:
 
   deploy:
     needs: refresh
+
     permissions:
       pages: write
       id-token: write
-    runs-on: ubuntu-24.04
+
+    runs-on: ubuntu-latest
 
     steps:
       - name: Deploy to GitHub Pages
