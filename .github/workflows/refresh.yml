@@ -1,33 +1,26 @@
-name: Refresh bin schedule & WhatsApp notify
+name: Nightly bin data refresh (no WhatsApp)
 
 on:
-  workflow_dispatch:
-    inputs:
-      postcode:
-        description: "Postcode (e.g., PL6 5HX)"
-        required: true
-        default: "PL6 5HX"
-      address_hint:
-        description: "Address hint (e.g., 72 Windermere)"
-        required: true
-        default: "72 Windermere"
-      force_send:
-        description: "Send a test WhatsApp now (ignores schedule)"
-        required: false
-        default: "false"
-
-  # Daily run at 17:15 UTC
+  # Runs every night at 02:15 UTC
   schedule:
-    - cron: "15 17 * * *"
+    - cron: "15 2 * * *"
 
-# Avoid overlapping runs
+  # Handy for manual checks
+  workflow_dispatch:
+
+# Force GitHub JavaScript actions to run on Node.js 24
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# Avoid clashing page deployments if two workflows overlap
 concurrency:
-  group: pages-build-and-notify
-  cancel-in-progress: true
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   refresh:
-    runs-on: ubuntu-latest
+    # Pin to Ubuntu 24.04 because Playwright 1.55.0 does not support Ubuntu 26.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -43,7 +36,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install "rich>=13.0.0"
           python -m playwright install --with-deps chromium
 
       - name: Run scraper (headless)
@@ -51,15 +43,14 @@ jobs:
           HEADLESS: "true"
           DEBUG_PAUSE: "false"
           OUTPUT_DIR: public
-          # manual-run inputs
-          POSTCODE_INPUT: ${{ github.event.inputs.postcode }}
-          ADDRESS_HINT_INPUT: ${{ github.event.inputs.address_hint }}
-          # scheduled defaults
+
+          # Defaults for unattended runs
           POSTCODE_DEFAULT: "PL6 5HX"
           ADDRESS_HINT_DEFAULT: "72 Windermere"
+
         run: |
-          export POSTCODE="${POSTCODE_INPUT:-$POSTCODE_DEFAULT}"
-          export ADDRESS_HINT="${ADDRESS_HINT_INPUT:-$ADDRESS_HINT_DEFAULT}"
+          export POSTCODE="$POSTCODE_DEFAULT"
+          export ADDRESS_HINT="$ADDRESS_HINT_DEFAULT"
           python scraper.py
 
       - name: Upload Pages artifact
@@ -69,57 +60,11 @@ jobs:
 
   deploy:
     needs: refresh
-    runs-on: ubuntu-latest
     permissions:
       pages: write
       id-token: write
+    runs-on: ubuntu-24.04
+
     steps:
       - name: Deploy to GitHub Pages
         uses: actions/deploy-pages@v4
-
-  notify:
-    needs: deploy
-    if: ${{ always() && (needs.refresh.result == 'success') && (needs.deploy.result == 'success') }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install notify deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Wait for GitHub Pages to serve the new JSON (retry)
-        env:
-          JSON_URL: https://jackberryman.github.io/plymouth-bin-scraper/PL6_5HX_72_Windermere.json
-        run: |
-          echo "Probing $JSON_URL until it returns 200..."
-          for i in $(seq 1 20); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$JSON_URL")
-            if [ "$code" = "200" ]; then
-              echo "OK (200) after $i attempt(s)."
-              exit 0
-            fi
-            echo "Attempt $i: got $code, retrying in 10s…"
-            sleep 10
-          done
-          echo "JSON never appeared in time."
-          exit 1
-
-      - name: Send WhatsApp if tomorrow is a collection day
-        env:
-          BIN_JSON_URL: https://jackberryman.github.io/plymouth-bin-scraper/PL6_5HX_72_Windermere.json
-          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
-          TWILIO_AUTH_TOKEN:  ${{ secrets.TWILIO_AUTH_TOKEN }}
-          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
-          TWILIO_WHATSAPP_TO:  ${{ secrets.TWILIO_WHATSAPP_TO }}
-          FORCE_SEND: ${{ github.event.inputs.force_send }}
-          TEST_TEXT: "Test ping from workflow at ${{ github.run_id }} ✅"
-        run: python notify.py
